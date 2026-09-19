@@ -1,11 +1,18 @@
-from rest_framework import viewsets
+from __future__ import annotations
+
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from .models import APISpecification, AnalysisJob, Comparison, Dependency, Project
+from .models import (
+    APISpecification,
+    AnalysisJob,
+    Comparison,
+    Dependency,
+    Project,
+)
 from .permissions import IsOwner
 from .serializers import (
-    APIChangeRecordSerializer,
     APISpecificationSerializer,
     AnalysisJobSerializer,
     ComparisonSerializer,
@@ -23,7 +30,9 @@ class OwnedQuerySetMixin:
     permission_classes = (IsOwner,)
 
     def get_queryset(self):
-        return self.queryset.filter(project__owner=self.request.user)
+        return self.queryset.filter(
+            project__owner=self.request.user
+        )
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
@@ -31,67 +40,210 @@ class ProjectViewSet(viewsets.ModelViewSet):
     permission_classes = (IsOwner,)
 
     def get_queryset(self):
-        return Project.objects.filter(owner=self.request.user)
+        return Project.objects.filter(
+            owner=self.request.user
+        )
 
 
-class APISpecificationViewSet(OwnedQuerySetMixin, viewsets.ModelViewSet):
+class APISpecificationViewSet(
+    OwnedQuerySetMixin,
+    viewsets.ModelViewSet,
+):
     serializer_class = APISpecificationSerializer
-    queryset = APISpecification.objects.select_related("project")
 
-
-class ComparisonViewSet(OwnedQuerySetMixin, viewsets.ModelViewSet):
-    serializer_class = ComparisonSerializer
-    queryset = Comparison.objects.select_related(
-        "project",
-        "old_specification",
-        "new_specification",
-    ).prefetch_related(
-        "changes__impact_reports",
-        "changes__evidence_records",
+    queryset = APISpecification.objects.select_related(
+        "project"
     )
 
-    @action(detail=True, methods=["get"])
+
+class ComparisonViewSet(
+    OwnedQuerySetMixin,
+    viewsets.ModelViewSet,
+):
+    serializer_class = ComparisonSerializer
+
+    queryset = (
+        Comparison.objects
+        .select_related(
+            "project",
+            "old_specification",
+            "new_specification",
+            "base_spec",
+            "head_spec",
+        )
+        .prefetch_related(
+            "changes__impact_reports",
+            "changes__evidence_records",
+        )
+    )
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="status",
+    )
+    def comparison_status(self, request, pk=None):
+        comparison = self.get_object()
+
+        return Response(
+            {
+                "id": comparison.id,
+                "status": comparison.status,
+                "gate_status": comparison.gate_status,
+                "gate_reason_code": (
+                    comparison.gate_reason_code
+                ),
+                "summary_counts": (
+                    comparison.summary_counts
+                ),
+                "quality": (
+                    comparison.quality_report
+                ),
+                "error": comparison.error,
+            }
+        )
+
+    @action(
+        detail=True,
+        methods=["get"],
+    )
     def changes(self, request, pk=None):
         comparison = self.get_object()
-        serializer = DetailedAPIChangeSerializer(comparison.changes.all(), many=True)
+
+        serializer = DetailedAPIChangeSerializer(
+            comparison.changes.all(),
+            many=True,
+            context=self.get_serializer_context(),
+        )
+
         return Response(serializer.data)
 
-    @action(detail=True, methods=["get"])
+    @action(
+        detail=True,
+        methods=["get"],
+    )
     def impact(self, request, pk=None):
         comparison = self.get_object()
-        serializer = ImpactReportRecordSerializer(comparison.impact_reports.all(), many=True)
+
+        serializer = ImpactReportRecordSerializer(
+            comparison.impact_reports.all(),
+            many=True,
+            context=self.get_serializer_context(),
+        )
+
         return Response(serializer.data)
 
-    @action(detail=True, methods=["get"])
+    @action(
+        detail=True,
+        methods=["get"],
+    )
     def evidence(self, request, pk=None):
         comparison = self.get_object()
+
         records = []
+
         for change in comparison.changes.all():
-            records.extend(change.evidence_records.all())
-        serializer = EvidenceSerializer(records, many=True)
+            records.extend(
+                change.evidence_records.all()
+            )
+
+        serializer = EvidenceSerializer(
+            records,
+            many=True,
+            context=self.get_serializer_context(),
+        )
+
         return Response(serializer.data)
 
-    @action(detail=True, methods=["get"])
+    @action(
+        detail=True,
+        methods=["get"],
+    )
     def migration(self, request, pk=None):
         comparison = self.get_object()
-        if not hasattr(comparison, "migration_plan"):
+
+        try:
+            migration_plan = comparison.migration_plan
+        except Comparison.migration_plan.RelatedObjectDoesNotExist:
             return Response({})
-        serializer = MigrationPlanSerializer(comparison.migration_plan)
+
+        serializer = MigrationPlanSerializer(
+            migration_plan,
+            context=self.get_serializer_context(),
+        )
+
         return Response(serializer.data)
 
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="quality",
+    )
+    def quality(self, request, pk=None):
+        comparison = self.get_object()
 
-class AnalysisJobViewSet(OwnedQuerySetMixin, viewsets.ModelViewSet):
+        return Response(
+            comparison.quality_report or {}
+        )
+
+
+class AnalysisJobViewSet(
+    OwnedQuerySetMixin,
+    viewsets.ModelViewSet,
+):
     serializer_class = AnalysisJobSerializer
-    queryset = AnalysisJob.objects.select_related("project", "comparison").prefetch_related(
-        "comparison__changes__impact_reports",
-        "comparison__changes__evidence_records",
+
+    queryset = (
+        AnalysisJob.objects
+        .select_related(
+            "project",
+            "comparison",
+        )
+        .prefetch_related(
+            "comparison__changes__impact_reports",
+            "comparison__changes__evidence_records",
+        )
     )
 
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="status",
+    )
+    def job_status(self, request, pk=None):
+        job = self.get_object()
+
+        return Response(
+            {
+                "id": job.id,
+                "status": job.status,
+                "stage": job.stage,
+                "progress": job.progress,
+                "attempts": job.attempts,
+                "heartbeat_at": job.heartbeat_at,
+                "error_code": job.error_code,
+                "error": job.error,
+                "comparison_id": job.comparison_id,
+            }
+        )
+
     def perform_create(self, serializer):
-        job = serializer.save(status="queued")
+        job = serializer.save(
+            status="queued"
+        )
+
+        # Preserve the existing local/manual behavior.
+        # Real asynchronous execution will be introduced
+        # in the CI pipeline phase.
         run_analysis_job(job)
 
 
-class DependencyViewSet(OwnedQuerySetMixin, viewsets.ReadOnlyModelViewSet):
+class DependencyViewSet(
+    OwnedQuerySetMixin,
+    viewsets.ReadOnlyModelViewSet,
+):
     serializer_class = DependencySerializer
-    queryset = Dependency.objects.select_related("project")
+
+    queryset = Dependency.objects.select_related(
+        "project"
+    )

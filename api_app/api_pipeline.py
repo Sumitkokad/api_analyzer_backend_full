@@ -1,72 +1,91 @@
-from api_parser import load_api_spec
-from api_diff import compare_endpoints
-from schemas import APIChange
-from breaking_change_rules import classify_change as classify_rule
-from classification import classify_change as classify_llm
+from __future__ import annotations
+
+from typing import Any
+
+from .api_diff import compare_api_specs
+from .api_parser import load_api_spec
+from .breaking_change_rules import classify_change
+from .impact_analysis import analyze_impact
 
 
-def analyze_api(old_file, new_file):
-    # 1. Load API specifications
+def _retrieve_documentation(documentation_file: str | None, change: Any) -> str:
+    """
+    Retrieve optional documentation evidence for a single API change.
+
+    RAG/LLM is explanatory only. Retrieval failures must not block
+    deterministic API compatibility analysis.
+    """
+    if not documentation_file:
+        return ""
+
+    try:
+        from .vector_store import create_vector_store
+
+        vector_store = create_vector_store(documentation_file)
+        retriever = vector_store.as_retriever(
+            search_kwargs={"k": 2}
+        )
+
+        documents = retriever.invoke(str(change))
+
+        return "\n\n".join(
+            getattr(document, "page_content", "")
+            for document in documents
+            if getattr(document, "page_content", "")
+        )
+    except Exception:
+        return ""
+
+
+def analyze_api(
+    old_file,
+    new_file,
+    documentation_file: str | None = None,
+):
+    """
+    Legacy-compatible API analysis entry point.
+
+    Pipeline:
+        load -> semantic diff -> deterministic rules -> optional RAG
+        -> impact explanation
+
+    Deterministic rules remain authoritative for classification/severity.
+    """
     old_api = load_api_spec(old_file)
     new_api = load_api_spec(new_file)
 
-    # 2. Compare APIs
-    diff = compare_endpoints(old_api, new_api)
+    changes = compare_api_specs(
+        old_api,
+        new_api,
+    )
 
     results = []
 
-    # 3. Process removed endpoints
-    for endpoint in diff["removed"]:
-        change = APIChange(
-            change_type="endpoint_removed",
-            endpoint=endpoint,
-            old_value=endpoint,
-            new_value=None
+    for change in changes:
+        rule_result = classify_change(change)
+
+        documentation = _retrieve_documentation(
+            documentation_file,
+            change,
         )
 
-        rule_result = classify_rule(change)
-
-        llm_result = classify_llm(
-            f"""
-API change:
-{change}
-
-Deterministic classification:
-{rule_result}
-"""
+        impact_report = analyze_impact(
+            change,
+            documentation,
+            rule_result=rule_result,
         )
 
-        results.append({
-            "change": change,
-            "rule_result": rule_result,
-            "llm_result": llm_result
-        })
+        results.append(
+            {
+                "change": change,
+                "rule_result": rule_result,
 
-    # 4. Process added endpoints
-    for endpoint in diff["added"]:
-        change = APIChange(
-            change_type="endpoint_added",
-            endpoint=endpoint,
-            old_value=None,
-            new_value=endpoint
+                # Backward-compatible key.
+                "llm_result": impact_report,
+
+                # Preferred explicit name.
+                "impact_report": impact_report,
+            }
         )
-
-        rule_result = classify_rule(change)
-
-        llm_result = classify_llm(
-            f"""
-API change:
-{change}
-
-Deterministic classification:
-{rule_result}
-"""
-        )
-
-        results.append({
-            "change": change,
-            "rule_result": rule_result,
-            "llm_result": llm_result
-        })
 
     return results

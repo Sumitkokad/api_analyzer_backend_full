@@ -1,21 +1,21 @@
-from classification import classify_change
+import os
+import unittest
+from unittest.mock import patch
+
+try:
+    from .classification import classify_change
+except ImportError:
+    from classification import classify_change
 
 
-change = """
-The username field was removed from the request body
-of POST /users.
-"""
+class LLMClassificationTests(unittest.TestCase):
+    def test_classification_can_run_offline(self):
+        with patch.dict(os.environ, {"API_ANALYZER_DISABLE_LLM": "true"}, clear=False):
+            result = classify_change("The username field was removed from POST /users.")
 
-result = classify_change(change)
+        self.assertEqual(result.classification, "non-breaking")
+        self.assertEqual(result.severity, "low")
 
-print("\nRESULT:")
-print(result)
 
-print("\nCLASSIFICATION:")
-print(result.classification)
-
-print("\nSEVERITY:")
-print(result.severity)
-
-print("\nREASON:")
-print(result.reason)
+if __name__ == "__main__":
+    unittest.main()

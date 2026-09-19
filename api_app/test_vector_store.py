@@ -1,23 +1,25 @@
-from vector_store import create_vector_store
+import unittest
+
+try:
+    from .embeddings import LocalHashEmbeddings
+    from .vector_store import _collection_name
+except ImportError:
+    from embeddings import LocalHashEmbeddings
+    from vector_store import _collection_name
 
 
-vector_store = create_vector_store(
-    "./project/data/old_api.yaml"
-)
+class VectorStoreTests(unittest.TestCase):
+    def test_collection_name_is_stable(self):
+        self.assertEqual(
+            _collection_name("./project/data/old_api.yaml"),
+            _collection_name("./project/data/old_api.yaml"),
+        )
 
-retriever = vector_store.as_retriever(
-    search_kwargs={"k": 2}
-)
+    def test_local_hash_embeddings_are_deterministic(self):
+        embeddings = LocalHashEmbeddings()
+        self.assertEqual(embeddings.embed_query("abc"), embeddings.embed_query("abc"))
+        self.assertEqual(len(embeddings.embed_query("abc")), 32)
 
 
-query = "How can I get users?"
-
-documents = retriever.invoke(query)
-
-
-print("\nRETRIEVED DOCUMENTS")
-print("=" * 50)
-
-for i, document in enumerate(documents):
-    print(f"\n--- DOCUMENT {i + 1} ---")
-    print(document.page_content)
+if __name__ == "__main__":
+    unittest.main()

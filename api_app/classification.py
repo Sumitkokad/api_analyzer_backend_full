@@ -1,56 +1,106 @@
-from typing import Literal
+from __future__ import annotations
 
-from pydantic import BaseModel
+from typing import Any, Literal
 
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, ConfigDict
 
-try:
-    from .llm import invoke_llm
-except ImportError:
-    from llm import invoke_llm
+from .breaking_change_rules import (
+    RULES_VERSION,
+    classify_change as deterministic_classify_change,
+    evaluate as evaluate_change,
+)
+
+
+ClassificationType = Literal[
+    "breaking",
+    "non-breaking",
+    "potentially-breaking",
+]
+
+SeverityType = Literal[
+    "low",
+    "medium",
+    "high",
+]
 
 
 class ChangeClassification(BaseModel):
-    classification: Literal["breaking", "non-breaking"]
-    severity: Literal["low", "medium", "high", "critical"]
-    reason: str
+    """
+    Backward-compatible classification model.
+
+    Classification and severity always come from the deterministic
+    breaking_change_rules engine. No LLM is used here.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    classification: ClassificationType
+    severity: SeverityType
+    reason: str = ""
+    rule_id: str | None = None
+    remediation_hint: str | None = None
+    flags: list[str] = []
+    rules_version: str = RULES_VERSION
+
+    def __getitem__(self, key: str) -> Any:
+        """
+        Compatibility with legacy code that treated classification
+        results like dictionaries.
+        """
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump()
 
 
-parser = PydanticOutputParser(
-    pydantic_object=ChangeClassification
-)
+def classify_change(
+    change: dict[str, Any] | Any,
+    *,
+    response_added_required_policy: str = "tolerant_reader",
+) -> ChangeClassification:
+    """
+    Classify one API change using the deterministic rule engine.
+
+    This function intentionally contains no LLM call.
+    """
+    result = deterministic_classify_change(
+        change,
+        response_added_required_policy=response_added_required_policy,
+    )
+
+    return ChangeClassification(
+        classification=result["classification"],
+        severity=result["severity"],
+        reason=result.get("reason", ""),
+        rule_id=result.get("rule_id"),
+        remediation_hint=result.get("remediation_hint"),
+        flags=result.get("flags", []),
+        rules_version=result.get("rules_version", RULES_VERSION),
+    )
 
 
-prompt = PromptTemplate(
-    template="""
-You are an API compatibility analyst.
-
-Analyze the following API change:
-
-{change}
-
-Determine whether this change is breaking or non-breaking.
-
-Assign an appropriate severity.
-
-Return ONLY the structured JSON required by the format instructions.
-
-{format_instructions}
-""",
-    input_variables=["change"],
-    partial_variables={
-        "format_instructions": parser.get_format_instructions()
-    }
-)
+def evaluate(
+    change: dict[str, Any] | Any,
+    *,
+    response_added_required_policy: str = "tolerant_reader",
+):
+    """
+    Expose the pure rule evaluation API while preserving this module
+    as a compatibility layer.
+    """
+    return evaluate_change(
+        change,
+        response_added_required_policy=response_added_required_policy,
+    )
 
 
-def classify_change(change):
-
-    formatted_prompt = prompt.invoke({
-        "change": change
-    })
-
-    response = invoke_llm(formatted_prompt)
-
-    return parser.parse(getattr(response, "content", response))
+__all__ = [
+    "ChangeClassification",
+    "ClassificationType",
+    "SeverityType",
+    "classify_change",
+    "evaluate",
+]

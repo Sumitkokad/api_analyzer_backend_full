@@ -1,13 +1,29 @@
-from schemas import APIChange
+import unittest
+
+try:
+    from .schemas import APIChange
+except ImportError:
+    from schemas import APIChange
 
 
-change = APIChange(
-    change_type="endpoint_added",
-    endpoint="/products",
-    old_value=None,
-    new_value="GET /products"
-)
+class SchemaTests(unittest.TestCase):
+    def test_api_change_generates_stable_id(self):
+        first = APIChange(
+            change_type="endpoint_added",
+            endpoint="/products",
+            old_value=None,
+            new_value="GET /products",
+        )
+        second = APIChange(
+            change_type="endpoint_added",
+            endpoint="/products",
+            old_value=None,
+            new_value="GET /products",
+        )
 
-print(change)
-print(change.change_type)
-print(change.endpoint)
+        self.assertEqual(first.change_id, second.change_id)
+        self.assertEqual(first.change_type, "endpoint_added")
+
+
+if __name__ == "__main__":
+    unittest.main()
