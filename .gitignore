@@ -1,1 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment variables / secrets
 .env
+.env.*
+!.env.example
+
+# Local SQLite database
+db.sqlite3
+db.sqlite3-journal
+
+# Django generated files
+staticfiles/
+media/
+processed_files/
+
+# Logs / runtime
+logs/
+*.log
+*.pid
+tmp/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local ChromaDB / vector store
+.chroma/
+chroma/
+chromadb/
+chroma_db/
+vector_store/
+
+# Temporary files
+*.tmp
+*.temp
