@@ -2,7 +2,7 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 from .ci_status_views import CIComparisonStatusView
 
-from .ci_views import CIAnalyzeView
+from .ci_views import CIAnalyzeView , CIProcessJobView
 from .views import (
     APISpecificationViewSet,
     AnalysisJobViewSet,
@@ -44,10 +44,11 @@ router.register(
 )
 
 urlpatterns = [
+    path("ci/analyze", CIAnalyzeView.as_view(), name="ci-analyze"),
     path(
-        "ci/analyze",
-        CIAnalyzeView.as_view(),
-        name="ci-analyze",
+        "ci/jobs/<int:job_id>/process",
+        CIProcessJobView.as_view(),
+        name="ci-process-job",
     ),
 
     path(
