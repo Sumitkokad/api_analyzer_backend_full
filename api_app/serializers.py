@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db import IntegrityError, transaction
 from rest_framework import serializers
 
 from .api_normalization import (
@@ -44,54 +45,52 @@ def _assert_project_owner(project, user):
 class ProjectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Project
+        fields = ("id", "name", "description", "created_at", "updated_at")
+        read_only_fields = ("id", "created_at", "updated_at")
 
-        fields = (
-            "id",
-            "name",
-            "description",
-            "repository_full_name",
-            "default_branch",
-            "baseline_mode",
-            "spec_path",
-            "adapter_type",
-            "error_mode",
-            "min_quality_score",
-            "response_added_required_policy",
-            "fail_severity_threshold",
-            "potentially_breaking_policy",
-            "created_at",
-            "updated_at",
-        )
+    def validate_name(self, value):
+        user = self.context["request"].user
+        name = value.strip()
 
-        read_only_fields = (
-            "id",
-            "created_at",
-            "updated_at",
-        )
-
-    def create(self, validated_data):
-        user = _request_user(self)
-
-        if user is None or not user.is_authenticated:
+        if not name:
             raise serializers.ValidationError(
-                "Authentication is required."
+                "Project name cannot be empty."
             )
 
-        return Project.objects.create(
+        queryset = Project.objects.filter(
             owner=user,
-            **validated_data,
+            name=name,
         )
 
-    def update(self, instance, validated_data):
-        _assert_project_owner(
-            instance,
-            _request_user(self),
-        )
+        # During update, don't compare the project against itself.
+        if self.instance is not None:
+            queryset = queryset.exclude(pk=self.instance.pk)
 
-        return super().update(
-            instance,
-            validated_data,
-        )
+        if queryset.exists():
+            raise serializers.ValidationError(
+                "A project with this name already exists."
+            )
+
+        return name
+
+    def create(self, validated_data):
+        user = self.context["request"].user
+
+        try:
+            with transaction.atomic():
+                return Project.objects.create(
+                    owner=user,
+                    **validated_data,
+                )
+
+        except IntegrityError as exc:
+            # Protect against a race condition where two requests
+            # try to create the same project at the same time.
+            raise serializers.ValidationError(
+                {
+                    "name": "A project with this name already exists."
+                }
+            ) from exc
 
 
 class APISpecificationSerializer(serializers.ModelSerializer):
