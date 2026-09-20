@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+import hashlib
+import secrets
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -10,6 +11,7 @@ from .models import (
     Comparison,
     Dependency,
     Project,
+    ProjectToken,
 )
 from .permissions import IsOwner
 from .serializers import (
@@ -40,8 +42,45 @@ class ProjectViewSet(viewsets.ModelViewSet):
     permission_classes = (IsOwner,)
 
     def get_queryset(self):
-        return Project.objects.filter(
-            owner=self.request.user
+        return Project.objects.filter(owner=self.request.user)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="tokens",
+    )
+    def create_token(self, request, pk=None):
+        project = self.get_object()
+
+        token_name = request.data.get(
+            "name",
+            "GitHub Actions CI",
+        ).strip()
+
+        if not token_name:
+            token_name = "GitHub Actions CI"
+
+        raw_token = secrets.token_urlsafe(48)
+
+        token_hash = hashlib.sha256(
+            raw_token.encode("utf-8")
+        ).hexdigest()
+
+        token = ProjectToken.objects.create(
+            project=project,
+            name=token_name,
+            token_hash=token_hash,
+        )
+
+        return Response(
+            {
+                "id": token.id,
+                "project_id": project.id,
+                "name": token.name,
+                "token": raw_token,
+                "warning": "Copy this token now. It will not be shown again.",
+            },
+            status=201,
         )
 
 
