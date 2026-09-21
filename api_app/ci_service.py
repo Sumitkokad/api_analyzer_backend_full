@@ -8,15 +8,16 @@ from typing import Any, Mapping
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
+from .execution_policy import decide_execution
 from .models import (
     APISpecification,
     AnalysisJob,
     Comparison,
     Project,
 )
+from .services import run_analysis_job
 
 
-MAX_SPEC_BYTES = 4 * 1024 * 1024
 MAX_IDEMPOTENCY_KEY_LENGTH = 255
 MAX_REPOSITORY_LENGTH = 300
 MAX_SHA_LENGTH = 128
@@ -71,19 +72,6 @@ def _validate_spec(
     if not isinstance(content, Mapping):
         raise CIValidationError(
             f"{name}.content must be an object."
-        )
-
-    content_bytes = len(
-        json.dumps(
-            content,
-            ensure_ascii=False,
-            default=str,
-        ).encode("utf-8")
-    )
-
-    if content_bytes > MAX_SPEC_BYTES:
-        raise CIValidationError(
-            f"{name}.content exceeds the 4 MB limit."
         )
 
     return result
@@ -216,10 +204,7 @@ def _validate_payload(
         [],
     )
 
-    if not isinstance(
-        generator_warnings,
-        list,
-    ):
+    if not isinstance(generator_warnings, list):
         raise CIValidationError(
             "generator_warnings must be a list."
         )
@@ -424,7 +409,6 @@ def _job_kwargs(
     return kwargs
 
 
-
 def create_ci_submission(
     project: Project,
     payload: Mapping[str, Any],
@@ -432,8 +416,12 @@ def create_ci_submission(
     """
     Create or return an idempotent CI comparison submission.
 
-    This function does not execute the comparison.
-    The existing analysis pipeline is invoked by the job-processing stage.
+    This function ONLY validates the request and persists the immutable
+    CI snapshots, comparison, and analysis job.
+
+    It intentionally does not execute the analysis.
+
+    Execution must happen after this database transaction has committed.
     """
 
     if not isinstance(payload, Mapping):
@@ -520,16 +508,218 @@ def create_ci_submission(
         raise
 
 
+def _mark_capacity_error(job: AnalysisJob) -> None:
+    """
+    Mark a job as terminally failed when the current deployment
+    cannot safely execute the requested contract.
+
+    A separate worker can later be enabled for larger contracts.
+    """
+
+    comparison = job.comparison
+
+    now = timezone.now()
+
+    job.status = "failed"
+    job.progress = 100
+
+    model_fields = {
+        field.name
+        for field in AnalysisJob._meta.get_fields()
+    }
+
+    update_fields = [
+        "status",
+        "progress",
+        "updated_at",
+    ]
+
+    if "completed_at" in model_fields:
+        job.completed_at = now
+        update_fields.append("completed_at")
+
+    if "stage" in model_fields:
+        job.stage = "failed"
+        update_fields.append("stage")
+
+    if "error_code" in model_fields:
+        job.error_code = "ANALYZER_CAPACITY_LIMIT"
+        update_fields.append("error_code")
+
+    if "error_detail" in model_fields:
+        job.error_detail = (
+            "The API contract exceeds the synchronous analyzer limits "
+            "and no background worker is currently enabled."
+        )
+        update_fields.append("error_detail")
+
+    job.save(
+        update_fields=list(dict.fromkeys(update_fields))
+    )
+
+    comparison.status = "failed"
+
+    comparison_fields = {
+        field.name
+        for field in Comparison._meta.get_fields()
+    }
+
+    comparison_update_fields = [
+        "status",
+        "updated_at",
+    ]
+
+    if "gate_status" in comparison_fields:
+        comparison.gate_status = "ERROR"
+        comparison_update_fields.append("gate_status")
+
+    if "gate_reason_code" in comparison_fields:
+        comparison.gate_reason_code = (
+            "ANALYZER_CAPACITY_LIMIT"
+        )
+        comparison_update_fields.append("gate_reason_code")
+
+    if "error" in comparison_fields:
+        comparison.error = (
+            "The API contract exceeds the synchronous analyzer "
+            "limits and no background worker is currently enabled."
+        )
+        comparison_update_fields.append("error")
+
+    if "quality_report" in comparison_fields:
+        comparison.quality_report = {
+            "status": "error",
+            "reason_code": "ANALYZER_CAPACITY_LIMIT",
+        }
+        comparison_update_fields.append("quality_report")
+
+    comparison.save(
+        update_fields=list(
+            dict.fromkeys(comparison_update_fields)
+        )
+    )
+
+
+def _execute_sync(job: AnalysisJob) -> AnalysisJob:
+    """
+    Execute an analysis immediately.
+
+    The job has already been committed to the database before this
+    function is called.
+    """
+
+    return run_analysis_job(job)
+
+
+def dispatch_ci_submission(
+    submission_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """
+    Decide how a newly-created CI job should execute.
+
+    Important:
+    This function must be called AFTER create_ci_submission()
+    has completed its database transaction.
+    """
+
+    comparison = submission_result["comparison"]
+    job = submission_result["job"]
+
+    # Idempotent retry:
+    # Never execute an already terminal job again.
+    if job is None:
+        return dict(submission_result)
+
+    if job.status in {
+        "completed",
+        "failed",
+        "cancelled",
+    }:
+        return dict(submission_result)
+
+    # If another process already picked it up, do not run it again.
+    if job.status == "running":
+        return dict(submission_result)
+
+    base_spec = comparison.old_specification.content
+    head_spec = comparison.new_specification.content
+
+    decision = decide_execution(
+        base_spec,
+        head_spec,
+    )
+
+    if decision.mode == "sync":
+        try:
+            processed_job = _execute_sync(job)
+
+            # Refresh the comparison so the response reflects
+            # PASS/WARN/FAIL immediately when available.
+            comparison.refresh_from_db()
+
+            result = dict(submission_result)
+            result["job"] = processed_job
+            result["comparison"] = comparison
+            result["execution_mode"] = "sync"
+            result["execution_reason"] = decision.reason
+
+            return result
+
+        except Exception:
+            # run_analysis_job() already records the failure state.
+            job.refresh_from_db()
+            comparison.refresh_from_db()
+
+            result = dict(submission_result)
+            result["job"] = job
+            result["comparison"] = comparison
+            result["execution_mode"] = "sync"
+            result["execution_reason"] = "ANALYZER_EXECUTION_FAILED"
+
+            return result
+
+    if decision.mode == "async":
+        # The job remains queued.
+        # A background worker will claim and execute it.
+        result = dict(submission_result)
+        result["execution_mode"] = "async"
+        result["execution_reason"] = decision.reason
+
+        return result
+
+    # No worker and contract exceeds the synchronous capacity.
+    _mark_capacity_error(job)
+
+    job.refresh_from_db()
+    comparison.refresh_from_db()
+
+    result = dict(submission_result)
+    result["job"] = job
+    result["comparison"] = comparison
+    result["execution_mode"] = "error"
+    result["execution_reason"] = decision.reason
+
+    return result
+
+
 def build_ci_response(
     submission_result: Mapping[str, Any],
 ) -> dict[str, Any]:
     comparison = submission_result["comparison"]
     job = submission_result["job"]
 
+    execution_mode = submission_result.get(
+        "execution_mode"
+    )
+
+    # 200-style completed result when synchronous execution
+    # already finished. Otherwise the caller can return 202.
+    status = comparison.status
+
     return {
         "comparison_id": comparison.pk,
         "job_id": job.pk if job else None,
-        "status": comparison.status,
+        "status": status,
         "gate_status": getattr(
             comparison,
             "gate_status",
@@ -539,6 +729,10 @@ def build_ci_response(
             f"/api/comparisons/{comparison.pk}/"
         ),
         "created": submission_result["created"],
+        "execution_mode": execution_mode,
+        "execution_reason": submission_result.get(
+            "execution_reason"
+        ),
     }
 
 
@@ -547,4 +741,5 @@ __all__ = [
     "CIValidationError",
     "build_ci_response",
     "create_ci_submission",
+    "dispatch_ci_submission",
 ]

@@ -129,7 +129,7 @@ class CIAnalyzeViewTests(TestCase):
 
         return request
 
-    def test_valid_ci_request_returns_202(self):
+    def test_valid_ci_request_returns_200(self):
         request = self._request(
             token=self.raw_token
         )
@@ -138,12 +138,12 @@ class CIAnalyzeViewTests(TestCase):
 
         self.assertEqual(
             response.status_code,
-            202,
+            200,
         )
 
         self.assertEqual(
             response.data["status"],
-            "queued",
+            "completed",
         )
 
         self.assertIsNotNone(
@@ -229,12 +229,12 @@ class CIAnalyzeViewTests(TestCase):
 
         self.assertEqual(
             first_response.status_code,
-            202,
+            200,
         )
 
         self.assertEqual(
             second_response.status_code,
-            202,
+            200,
         )
 
         self.assertEqual(

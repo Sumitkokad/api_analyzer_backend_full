@@ -81,7 +81,7 @@ class CIAnalyzeURLTests(TestCase):
             url.endswith("/ci/analyze")
         )
 
-    def test_ci_endpoint_returns_202(self):
+    def test_ci_endpoint_returns_200(self):
         self.client.credentials(
             HTTP_AUTHORIZATION=(
                 f"Bearer {self.raw_token}"
@@ -98,12 +98,12 @@ class CIAnalyzeURLTests(TestCase):
 
         self.assertEqual(
             response.status_code,
-            202,
+            200,
         )
 
         self.assertEqual(
             response.data["status"],
-            "queued",
+            "completed",
         )
 
         self.assertIsNotNone(
