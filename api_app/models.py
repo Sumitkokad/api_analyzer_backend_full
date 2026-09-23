@@ -718,6 +718,31 @@ class AnalysisJob(TimeStampedModel):
     )
 
 
+class GitHubInstallState(TimeStampedModel):
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        related_name="github_install_states",
+    )
+    state_hash = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+    )
+    expires_at = models.DateTimeField()
+    consumed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=("project", "expires_at"),
+            ),
+        ]
+
+
 class GitHubConnection(TimeStampedModel):
     project = models.OneToOneField(
         Project,
@@ -730,6 +755,7 @@ class GitHubConnection(TimeStampedModel):
     )
     repository_full_name = models.CharField(
         max_length=300,
+        blank=True,
     )
     connected = models.BooleanField(
         default=True,
@@ -740,7 +766,7 @@ class GitHubConnection(TimeStampedModel):
     )
 
     def __str__(self):
-        return self.repository_full_name
+        return self.repository_full_name or f"GitHub installation {self.installation_id}"
 
 
 class Waiver(TimeStampedModel):

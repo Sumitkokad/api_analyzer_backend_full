@@ -4,6 +4,15 @@ from rest_framework.routers import DefaultRouter
 from .ci_status_views import CIComparisonStatusView
 from .ci_views import CIAnalyzeView
 
+from .github_views import (
+    GitHubConnectionView,
+    GitHubDisconnectView,
+    GitHubInstallCallbackView,
+    GitHubInstallStartView,
+    GitHubRepositoryConnectView,
+    GitHubRepositoryListView,
+)
+
 from .views import (
     APISpecificationViewSet,
     AnalysisJobViewSet,
@@ -47,6 +56,36 @@ router.register(
 
 
 urlpatterns = [
+    path(
+        "github/install/start/",
+        GitHubInstallStartView.as_view(),
+        name="github-install-start",
+    ),
+    path(
+        "github/install/callback/",
+        GitHubInstallCallbackView.as_view(),
+        name="github-install-callback",
+    ),
+    path(
+        "github/connection/",
+        GitHubConnectionView.as_view(),
+        name="github-connection",
+    ),
+    path(
+        "github/repositories/",
+        GitHubRepositoryListView.as_view(),
+        name="github-repositories",
+    ),
+    path(
+        "github/repositories/connect/",
+        GitHubRepositoryConnectView.as_view(),
+        name="github-repository-connect",
+    ),
+    path(
+        "github/disconnect/",
+        GitHubDisconnectView.as_view(),
+        name="github-disconnect",
+    ),
     path(
         "ci/analyze",
         CIAnalyzeView.as_view(),
