@@ -19,6 +19,7 @@ from .github_service import (
     GitHubConfigurationError,
     hash_install_state,
 )
+from .github_scan_service import GitHubRepositoryScanner
 from .models import (
     AuditLog,
     GitHubConnection,
@@ -647,6 +648,133 @@ class GitHubRepositoryConnectView(APIView):
         )
 
 
+class GitHubRepositoryScanView(APIView):
+    """
+    Scan the selected GitHub repository for an OpenAPI/Swagger contract
+    and supported backend framework.
+
+    This endpoint is read-only with respect to the customer's repository.
+    It only stores the detected setup metadata on the API Analyzer project.
+    """
+
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        project_id = request.data.get("project_id")
+        project = _project_for_user(request, project_id)
+
+        if project is None:
+            return Response(
+                {"detail": "Project not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        connection = getattr(
+            project,
+            "github_connection",
+            None,
+        )
+
+        if (
+            connection is None
+            or not connection.installation_id
+            or not connection.repository_full_name
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Select a GitHub repository before scanning it."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            installation_id = int(
+                connection.installation_id
+            )
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "GitHub installation ID is invalid."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        try:
+            client = GitHubAppClient()
+
+            token_data = client.create_installation_token(
+                installation_id
+            )
+
+            scanner = GitHubRepositoryScanner(
+                github_client=client,
+                installation_token=str(
+                    token_data["token"]
+                ),
+            )
+
+            result = scanner.scan(
+                connection.repository_full_name,
+                default_branch=(
+                    project.default_branch
+                    or None
+                ),
+            )
+
+            # Store only the detected configuration needed by the
+            # subsequent setup step. The repository itself is never modified.
+            update_fields = []
+
+            if result.contract.found:
+                if project.spec_path != result.contract.path:
+                    project.spec_path = result.contract.path
+                    update_fields.append("spec_path")
+
+            if result.framework.detected:
+                if project.adapter_type != result.framework.adapter_type:
+                    project.adapter_type = result.framework.adapter_type
+                    update_fields.append("adapter_type")
+
+            if update_fields:
+                update_fields.append("updated_at")
+                project.save(update_fields=update_fields)
+
+        except GitHubConfigurationError:
+            return Response(
+                {
+                    "detail": (
+                        "GitHub App is not configured on the server."
+                    )
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        except GitHubAPIError:
+            return Response(
+                {
+                    "detail": (
+                        "Unable to scan the selected GitHub repository."
+                    )
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        except Exception:
+            return Response(
+                {
+                    "detail": (
+                        "Repository scan failed unexpectedly."
+                    )
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(
+            result.as_dict(),
+            status=status.HTTP_200_OK,
+        )
+
+
 class GitHubDisconnectView(APIView):
     permission_classes = (IsAuthenticated,)
 
@@ -708,4 +836,5 @@ __all__ = [
     "GitHubInstallStartView",
     "GitHubRepositoryConnectView",
     "GitHubRepositoryListView",
+    "GitHubRepositoryScanView",
 ]

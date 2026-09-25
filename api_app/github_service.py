@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import time
 from typing import Any, Mapping
@@ -523,6 +524,152 @@ class GitHubAppClient:
             )
 
         return data
+
+    def get_repository_tree(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+        *,
+        tree_ref: str,
+        recursive: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Read the repository Git tree for a branch/tag/commit ref.
+
+        The scanner uses this endpoint instead of recursively walking
+        directory-by-directory because GitHub's Contents API is limited
+        to 1,000 entries per directory.
+        """
+        parts = (
+            repository_full_name
+            .strip()
+            .split("/", 1)
+        )
+
+        if len(parts) != 2 or not all(parts):
+            raise GitHubAPIError(
+                "repository_full_name must use the "
+                "owner/repository format."
+            )
+
+        tree_ref = str(tree_ref or "").strip()
+        if not tree_ref:
+            raise GitHubAPIError("tree_ref is required.")
+
+        owner, repo = parts
+
+        data = self._request(
+            "GET",
+            f"/repos/{owner}/{repo}/git/trees/{quote(tree_ref, safe='')}",
+            authorization=(
+                f"Bearer {installation_token}"
+            ),
+            params={
+                "recursive": "1" if recursive else None,
+            },
+        )
+
+        if not isinstance(data, dict):
+            raise GitHubAPIError(
+                "GitHub repository tree response is invalid."
+            )
+
+        tree = data.get("tree", [])
+        if not isinstance(tree, list):
+            raise GitHubAPIError(
+                "GitHub repository tree response is invalid."
+            )
+
+        data["tree"] = [
+            item
+            for item in tree
+            if isinstance(item, dict)
+        ]
+
+        return data
+
+    def get_repository_file(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+        path: str,
+        *,
+        ref: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Read one repository file through GitHub's Contents API.
+
+        The method returns both the GitHub metadata and decoded UTF-8
+        text when GitHub provides the file as base64 content.
+        """
+        parts = (
+            repository_full_name
+            .strip()
+            .split("/", 1)
+        )
+
+        if len(parts) != 2 or not all(parts):
+            raise GitHubAPIError(
+                "repository_full_name must use the "
+                "owner/repository format."
+            )
+
+        path = str(path or "").strip().lstrip("/")
+        if not path:
+            raise GitHubAPIError("Repository file path is required.")
+
+        owner, repo = parts
+
+        params = {}
+        if ref:
+            params["ref"] = str(ref).strip()
+
+        data = self._request(
+            "GET",
+            f"/repos/{owner}/{repo}/contents/{quote(path, safe='/')}",
+            authorization=(
+                f"Bearer {installation_token}"
+            ),
+            params=params or None,
+        )
+
+        if not isinstance(data, dict):
+            raise GitHubAPIError(
+                "GitHub repository file response is invalid."
+            )
+
+        if data.get("type") != "file":
+            raise GitHubAPIError(
+                "GitHub repository path is not a file."
+            )
+
+        raw_content = data.get("content") or ""
+        encoding = str(data.get("encoding") or "").lower()
+
+        decoded_text = ""
+        if raw_content and encoding == "base64":
+            try:
+                decoded_text = base64.b64decode(
+                    raw_content,
+                    validate=False,
+                ).decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            except (ValueError, TypeError):
+                raise GitHubAPIError(
+                    "GitHub returned invalid file content."
+                )
+
+        return {
+            "path": data.get("path") or path,
+            "sha": data.get("sha") or "",
+            "size": data.get("size"),
+            "html_url": data.get("html_url") or "",
+            "encoding": encoding,
+            "content": decoded_text,
+            "download_url": data.get("download_url") or "",
+        }
 
 
 def hash_install_state(

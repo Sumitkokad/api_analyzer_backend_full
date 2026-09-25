@@ -11,6 +11,7 @@ from .github_views import (
     GitHubInstallStartView,
     GitHubRepositoryConnectView,
     GitHubRepositoryListView,
+    GitHubRepositoryScanView,
 )
 
 from .views import (
@@ -82,6 +83,11 @@ urlpatterns = [
         name="github-repository-connect",
     ),
     path(
+        "github/repository/scan/",
+        GitHubRepositoryScanView.as_view(),
+        name="github-repository-scan",
+    ),
+    path(
         "github/disconnect/",
         GitHubDisconnectView.as_view(),
         name="github-disconnect",
@@ -91,12 +97,10 @@ urlpatterns = [
         CIAnalyzeView.as_view(),
         name="ci-analyze",
     ),
-
     path(
         "ci/comparisons/<int:comparison_id>/status/",
         CIComparisonStatusView.as_view(),
         name="ci-comparison-status",
     ),
-
     *router.urls,
 ]
