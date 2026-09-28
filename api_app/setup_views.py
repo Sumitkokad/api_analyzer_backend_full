@@ -64,6 +64,32 @@ class GitHubRepositorySetupView(APIView):
 
     permission_classes = (IsAuthenticated,)
 
+    def dispatch(self, request, *args, **kwargs):
+        """
+        Last-resort JSON boundary for the complete DRF dispatch lifecycle.
+
+        This catches unexpected failures that occur before ``post()`` is
+        entered, such as request parsing, authentication, permissions, or
+        other DRF dispatch-stage exceptions.
+        """
+        try:
+            return super().dispatch(request, *args, **kwargs)
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "UNHANDLED SETUP DISPATCH FAILURE"
+            )
+
+            return Response(
+                {
+                    "detail": "Automatic repository setup failed before the setup handler completed.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
     def post(self, request):
         """
         Public POST entrypoint with a last-resort JSON error boundary.
