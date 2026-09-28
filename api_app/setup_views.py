@@ -17,7 +17,7 @@ The endpoint never asks the user for a GitHub PAT or CI token.
 """
 
 from __future__ import annotations
-
+from django.http import JsonResponse
 from typing import Any
 
 from rest_framework import status
@@ -66,14 +66,11 @@ class GitHubRepositorySetupView(APIView):
 
     def dispatch(self, request, *args, **kwargs):
         """
-        Last-resort JSON boundary for the complete DRF dispatch lifecycle.
-
-        This catches unexpected failures that occur before ``post()`` is
-        entered, such as request parsing, authentication, permissions, or
-        other DRF dispatch-stage exceptions.
+        Last-resort JSON boundary for the complete request lifecycle.
         """
         try:
             return super().dispatch(request, *args, **kwargs)
+
         except Exception as exc:
             import logging
 
@@ -81,13 +78,13 @@ class GitHubRepositorySetupView(APIView):
                 "UNHANDLED SETUP DISPATCH FAILURE"
             )
 
-            return Response(
+            return JsonResponse(
                 {
                     "detail": "Automatic repository setup failed before the setup handler completed.",
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status=500,
             )
 
     def post(self, request):
