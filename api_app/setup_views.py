@@ -87,7 +87,7 @@ class GitHubRepositorySetupView(APIView):
                 status=500,
             )
 
-    def post(self, request):
+    def post(self, request, project_id=None):
         """
         Public POST entrypoint with a last-resort JSON error boundary.
 
