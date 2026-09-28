@@ -321,6 +321,12 @@ class GitHubRepositorySetupView(APIView):
             )
 
         except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "Automatic GitHub repository setup failed."
+            )
+
             return Response(
                 {
                     "detail": (
