@@ -65,6 +65,31 @@ class GitHubRepositorySetupView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def post(self, request):
+        """
+        Public POST entrypoint with a last-resort JSON error boundary.
+
+        This prevents Django's default HTML 500 page from hiding an
+        unexpected exception occurring before/after the setup pipeline.
+        """
+        try:
+            return self._post_impl(request)
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "UNHANDLED SETUP VIEW FAILURE"
+            )
+
+            return Response(
+                {
+                    "detail": "Automatic repository setup failed.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def _post_impl(self, request):
         project_id = request.data.get(
             "project_id"
         )
