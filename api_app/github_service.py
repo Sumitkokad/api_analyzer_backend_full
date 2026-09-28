@@ -670,6 +670,574 @@ class GitHubAppClient:
             "content": decoded_text,
             "download_url": data.get("download_url") or "",
         }
+    def create_branch(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+        *,
+        branch_name: str,
+        from_sha: str | None = None,
+        from_branch: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Create a new branch from an exact commit SHA or an existing branch.
+
+        The method never overwrites an existing branch.
+        """
+
+        parts = (
+            repository_full_name
+            .strip()
+            .split("/", 1)
+        )
+
+        if len(parts) != 2 or not all(parts):
+            raise GitHubAPIError(
+                "repository_full_name must use the "
+                "owner/repository format."
+            )
+
+        branch_name = (
+            str(branch_name or "")
+            .strip()
+            .removeprefix("refs/heads/")
+        )
+
+        if not branch_name:
+            raise GitHubAPIError(
+                "branch_name is required."
+            )
+
+        if branch_name.startswith("/") or ".." in branch_name:
+            raise GitHubAPIError(
+                "Invalid branch_name."
+            )
+
+        from_sha = str(from_sha or "").strip()
+        from_branch = str(from_branch or "").strip()
+
+        if bool(from_sha) == bool(from_branch):
+            raise GitHubAPIError(
+                "Provide exactly one of from_sha or from_branch."
+            )
+
+        owner, repo = parts
+
+        source_sha = from_sha
+
+        if from_branch:
+            ref_data = self._request(
+                "GET",
+                (
+                    f"/repos/{owner}/{repo}/git/ref/heads/"
+                    f"{quote(from_branch, safe='/')}"
+                ),
+                authorization=(
+                    f"Bearer {installation_token}"
+                ),
+            )
+
+            if not isinstance(ref_data, dict):
+                raise GitHubAPIError(
+                    "GitHub branch reference response is invalid."
+                )
+
+            object_data = ref_data.get("object") or {}
+
+            if not isinstance(object_data, dict):
+                raise GitHubAPIError(
+                    "GitHub branch reference response is invalid."
+                )
+
+            source_sha = str(
+                object_data.get("sha") or ""
+            ).strip()
+
+            if not source_sha:
+                raise GitHubAPIError(
+                    "GitHub branch reference does not contain a SHA."
+                )
+
+        data = self._request(
+            "POST",
+            f"/repos/{owner}/{repo}/git/refs",
+            authorization=(
+                f"Bearer {installation_token}"
+            ),
+            json={
+                "ref": f"refs/heads/{branch_name}",
+                "sha": source_sha,
+            },
+        )
+
+        if not isinstance(data, dict):
+            raise GitHubAPIError(
+                "GitHub branch creation response is invalid."
+            )
+
+        return data
+
+    def create_or_update_repository_file(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+        *,
+        path: str,
+        content: str,
+        branch: str,
+        commit_message: str,
+    ) -> dict[str, Any]:
+        """
+        Create or update one repository file on a branch.
+
+        Existing files are updated using their current Git blob SHA.
+        New files are created without a SHA.
+        """
+
+        parts = (
+            repository_full_name
+            .strip()
+            .split("/", 1)
+        )
+
+        if len(parts) != 2 or not all(parts):
+            raise GitHubAPIError(
+                "repository_full_name must use the "
+                "owner/repository format."
+            )
+
+        path = str(path or "").strip().lstrip("/")
+
+        if not path:
+            raise GitHubAPIError(
+                "Repository file path is required."
+            )
+
+        branch = str(branch or "").strip()
+
+        if not branch:
+            raise GitHubAPIError(
+                "branch is required."
+            )
+
+        commit_message = str(
+            commit_message or ""
+        ).strip()
+
+        if not commit_message:
+            raise GitHubAPIError(
+                "commit_message is required."
+            )
+
+        if not isinstance(content, str):
+            raise GitHubAPIError(
+                "Repository file content must be text."
+            )
+
+        owner, repo = parts
+
+        existing_sha: str | None = None
+
+        try:
+            existing = self.get_repository_file(
+                installation_token,
+                repository_full_name,
+                path,
+                ref=branch,
+            )
+
+            existing_sha = str(
+                existing.get("sha") or ""
+            ).strip() or None
+
+        except GitHubAPIError as exc:
+            if exc.status_code != 404:
+                raise
+
+        encoded_content = base64.b64encode(
+            content.encode("utf-8")
+        ).decode("ascii")
+
+        payload: dict[str, Any] = {
+            "message": commit_message,
+            "content": encoded_content,
+            "branch": branch,
+        }
+
+        if existing_sha:
+            payload["sha"] = existing_sha
+
+        data = self._request(
+            "PUT",
+            (
+                f"/repos/{owner}/{repo}/contents/"
+                f"{quote(path, safe='/')}"
+            ),
+            authorization=(
+                f"Bearer {installation_token}"
+            ),
+            json=payload,
+        )
+
+        if not isinstance(data, dict):
+            raise GitHubAPIError(
+                "GitHub file write response is invalid."
+            )
+
+        return data
+
+    def create_pull_request(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+        *,
+        title: str,
+        head: str,
+        base: str,
+        body: str = "",
+    ) -> dict[str, Any]:
+        """
+        Create a pull request from head into base.
+        """
+
+        parts = (
+            repository_full_name
+            .strip()
+            .split("/", 1)
+        )
+
+        if len(parts) != 2 or not all(parts):
+            raise GitHubAPIError(
+                "repository_full_name must use the "
+                "owner/repository format."
+            )
+
+        title = str(title or "").strip()
+        head = str(head or "").strip()
+        base = str(base or "").strip()
+        body = str(body or "")
+
+        if not title:
+            raise GitHubAPIError(
+                "Pull request title is required."
+            )
+
+        if not head:
+            raise GitHubAPIError(
+                "Pull request head is required."
+            )
+
+        if not base:
+            raise GitHubAPIError(
+                "Pull request base is required."
+            )
+
+        owner, repo = parts
+
+        data = self._request(
+            "POST",
+            f"/repos/{owner}/{repo}/pulls",
+            authorization=(
+                f"Bearer {installation_token}"
+            ),
+            json={
+                "title": title,
+                "head": head,
+                "base": base,
+                "body": body,
+            },
+        )
+
+        if not isinstance(data, dict):
+            raise GitHubAPIError(
+                "GitHub pull request response is invalid."
+            )
+
+        return data
+
+    @staticmethod
+    def _validate_actions_name(
+        name: str,
+        *,
+        kind: str,
+    ) -> str:
+        """
+        Validate a GitHub Actions secret or variable name.
+        """
+        normalized = str(name or "").strip()
+
+        if not normalized:
+            raise GitHubAPIError(
+                f"GitHub Actions {kind} name is required."
+            )
+
+        if normalized.startswith("GITHUB_"):
+            raise GitHubAPIError(
+                f"GitHub Actions {kind} name cannot start with GITHUB_."
+            )
+
+        if not all(
+            character.isascii()
+            and (
+                character.isalnum()
+                or character == "_"
+            )
+            for character in normalized
+        ):
+            raise GitHubAPIError(
+                f"GitHub Actions {kind} name may contain only "
+                "ASCII letters, numbers, and underscores."
+            )
+
+        return normalized
+
+    @staticmethod
+    def _repository_parts(
+        repository_full_name: str,
+    ) -> tuple[str, str]:
+        parts = (
+            str(repository_full_name or "")
+            .strip()
+            .split("/", 1)
+        )
+
+        if len(parts) != 2 or not all(parts):
+            raise GitHubAPIError(
+                "repository_full_name must use the "
+                "owner/repository format."
+            )
+
+        return parts[0], parts[1]
+
+    def get_actions_public_key(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+    ) -> dict[str, str]:
+        """
+        Get the repository Actions public key required for encrypting
+        repository-level Actions secrets.
+        """
+        owner, repo = self._repository_parts(
+            repository_full_name
+        )
+
+        data = self._request(
+            "GET",
+            f"/repos/{owner}/{repo}/actions/secrets/public-key",
+            authorization=f"Bearer {installation_token}",
+        )
+
+        if not isinstance(data, dict):
+            raise GitHubAPIError(
+                "GitHub Actions public-key response is invalid."
+            )
+
+        key = str(
+            data.get("key") or ""
+        ).strip()
+
+        key_id = str(
+            data.get("key_id") or ""
+        ).strip()
+
+        if not key or not key_id:
+            raise GitHubAPIError(
+                "GitHub Actions public-key response is incomplete."
+            )
+
+        return {
+            "key": key,
+            "key_id": key_id,
+        }
+
+    @staticmethod
+    def _encrypt_actions_secret(
+        public_key: str,
+        secret_value: str,
+    ) -> str:
+        """
+        Encrypt a GitHub Actions secret using the sealed-box primitive
+        expected by GitHub's Actions secrets API.
+
+        PyNaCl is imported lazily so existing GitHub operations do not
+        require this dependency until a repository secret is configured.
+        """
+        try:
+            from nacl.public import (
+                PublicKey,
+                SealedBox,
+            )
+        except ImportError as exc:
+            raise GitHubConfigurationError(
+                "PyNaCl is required to configure GitHub Actions secrets. "
+                "Install it with: pip install pynacl."
+            ) from exc
+
+        try:
+            public_key_bytes = base64.b64decode(
+                str(public_key).encode("ascii"),
+                validate=True,
+            )
+
+            encrypted = SealedBox(
+                PublicKey(public_key_bytes)
+            ).encrypt(
+                str(secret_value).encode("utf-8")
+            )
+
+            return base64.b64encode(
+                encrypted
+            ).decode("ascii")
+
+        except (ValueError, TypeError) as exc:
+            raise GitHubAPIError(
+                "GitHub Actions public key is invalid."
+            ) from exc
+
+    def create_or_update_actions_secret(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+        *,
+        secret_name: str,
+        secret_value: str,
+    ) -> dict[str, Any]:
+        """
+        Create or replace one repository-level GitHub Actions secret.
+
+        The plaintext secret is never returned by this method.
+        """
+        name = self._validate_actions_name(
+            secret_name,
+            kind="secret",
+        )
+
+        if secret_value is None:
+            raise GitHubAPIError(
+                "GitHub Actions secret value is required."
+            )
+
+        if not isinstance(secret_value, str):
+            raise GitHubAPIError(
+                "GitHub Actions secret value must be text."
+            )
+
+        repository_key = self.get_actions_public_key(
+            installation_token,
+            repository_full_name,
+        )
+
+        encrypted_value = self._encrypt_actions_secret(
+            repository_key["key"],
+            secret_value,
+        )
+
+        owner, repo = self._repository_parts(
+            repository_full_name
+        )
+
+        self._request(
+            "PUT",
+            (
+                f"/repos/{owner}/{repo}/actions/secrets/"
+                f"{quote(name, safe='')}"
+            ),
+            authorization=f"Bearer {installation_token}",
+            json={
+                "encrypted_value": encrypted_value,
+                "key_id": repository_key["key_id"],
+            },
+        )
+
+        return {
+            "name": name,
+            "configured": True,
+        }
+
+    def create_or_update_actions_variable(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+        *,
+        variable_name: str,
+        value: str,
+    ) -> dict[str, Any]:
+        """
+        Create or update one repository-level GitHub Actions variable.
+
+        Existing variables use PATCH. If GitHub reports 404, the method
+        creates the variable with POST.
+        """
+        name = self._validate_actions_name(
+            variable_name,
+            kind="variable",
+        )
+
+        if value is None:
+            raise GitHubAPIError(
+                "GitHub Actions variable value is required."
+            )
+
+        if not isinstance(value, str):
+            raise GitHubAPIError(
+                "GitHub Actions variable value must be text."
+            )
+
+        owner, repo = self._repository_parts(
+            repository_full_name
+        )
+
+        variable_path = (
+            f"/repos/{owner}/{repo}/actions/variables/"
+            f"{quote(name, safe='')}"
+        )
+
+        try:
+            data = self._request(
+                "PATCH",
+                variable_path,
+                authorization=f"Bearer {installation_token}",
+                json={
+                    "name": name,
+                    "value": value,
+                },
+            )
+        except GitHubAPIError as exc:
+            if exc.status_code != 404:
+                raise
+
+            data = self._request(
+                "POST",
+                f"/repos/{owner}/{repo}/actions/variables",
+                authorization=f"Bearer {installation_token}",
+                json={
+                    "name": name,
+                    "value": value,
+                },
+            )
+
+            return {
+                "name": name,
+                "configured": True,
+                "created": True,
+                "response": (
+                    data
+                    if isinstance(data, dict)
+                    else {}
+                ),
+            }
+
+        return {
+            "name": name,
+            "configured": True,
+            "created": False,
+            "response": (
+                data
+                if isinstance(data, dict)
+                else {}
+            ),
+        }
 
 
 def hash_install_state(

@@ -93,6 +93,15 @@ class RepositoryScanResult:
     setup_required: bool = True
     warnings: list[str] = field(default_factory=list)
 
+    # Internal evidence used by the adapter layer.
+    # These are deliberately not exposed through as_dict(), because
+    # manifest contents can be large and may contain sensitive configuration.
+    tree_paths: tuple[str, ...] = ()
+    manifest_contents: dict[str, str] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "repository": self.repository,
@@ -116,7 +125,6 @@ class RepositoryScanResult:
             "setup_required": self.setup_required,
             "warnings": list(self.warnings),
         }
-
 
 def _normalize_path(path: str) -> str:
     return posixpath.normpath(
@@ -624,18 +632,22 @@ class GitHubRepositoryScanner:
             )
 
         return RepositoryScanResult(
-            repository=str(
-                repository.get("full_name")
-                or repository_full_name
-            ),
-            default_branch=resolved_branch,
-            contract=contract,
-            framework=framework,
-            scanned_files=len(file_paths),
-            tree_truncated=bool(tree_data.get("truncated")),
-            setup_required=True,
-            warnings=warnings,
-        )
+        repository=str(
+            repository.get("full_name")
+            or repository_full_name
+        ),
+        default_branch=resolved_branch,
+        contract=contract,
+        framework=framework,
+        scanned_files=len(file_paths),
+        tree_truncated=bool(
+            tree_data.get("truncated")
+        ),
+        setup_required=True,
+        warnings=warnings,
+        tree_paths=tuple(file_paths),
+        manifest_contents=dict(manifest_contents),
+    )
 
 
 __all__ = [

@@ -13,10 +13,16 @@ def _claim_job(job):
 
     This helper assumes the caller already holds a row lock
     inside transaction.atomic().
+
+    The runner only claims the job. The existing
+    services.run_analysis_job() function owns execution metadata
+    such as attempts, stage, and final state.
     """
 
+    now = timezone.now()
+
     job.status = "running"
-    job.started_at = timezone.now()
+    job.started_at = now
     job.progress = 5
 
     update_fields = [
@@ -31,12 +37,14 @@ def _claim_job(job):
         for field in AnalysisJob._meta.get_fields()
     }
 
-    if "attempts" in model_fields:
-        job.attempts += 1
-        update_fields.append("attempts")
+    # Do NOT increment attempts here.
+    #
+    # services.run_analysis_job() already increments attempts
+    # when the actual analysis execution begins. Keeping the
+    # increment in one place prevents double-counting.
 
     if "heartbeat_at" in model_fields:
-        job.heartbeat_at = timezone.now()
+        job.heartbeat_at = now
         update_fields.append("heartbeat_at")
 
     if "stage" in model_fields:
