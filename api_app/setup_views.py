@@ -359,42 +359,61 @@ class GitHubRepositorySetupView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        self._store_detected_configuration(
-            project=project,
-            scan_result=scan_result,
-            spec_path=setup_plan.spec_path,
-            adapter_type=setup_plan.adapter_type,
-        )
+        try:
+            self._store_detected_configuration(
+                project=project,
+                scan_result=scan_result,
+                spec_path=setup_plan.spec_path,
+                adapter_type=setup_plan.adapter_type,
+            )
 
-        AuditLog.objects.create(
-            project=project,
-            actor=request.user,
-            action="github_setup_pull_request_created",
-            resource_type="GitHubConnection",
-            resource_id=str(
-                connection.pk
-            ),
-            metadata={
-                "repository": repository_full_name,
-                "branch_name": execution.branch_name,
-                "base_branch": execution.base_branch,
-                "pull_request_number": (
-                    execution.pull_request_number
+            AuditLog.objects.create(
+                project=project,
+                actor=request.user,
+                action="github_setup_pull_request_created",
+                resource_type="GitHubConnection",
+                resource_id=str(
+                    connection.pk
                 ),
-                "pull_request_url": (
-                    execution.pull_request_url
-                ),
-                "adapter_type": setup_plan.adapter_type,
-                "framework_name": setup_plan.framework_name,
-                "spec_path": setup_plan.spec_path,
-                "ci_secret_name": provisioning.secret_name,
-                "ci_variable_name": provisioning.variable_name,
-                "ci_token_id": provisioning.token_id,
-                "ci_tokens_rotated": (
-                    provisioning.rotated_existing_tokens
-                ),
-            },
-        )
+                metadata={
+                    "repository": repository_full_name,
+                    "branch_name": execution.branch_name,
+                    "base_branch": execution.base_branch,
+                    "pull_request_number": (
+                        execution.pull_request_number
+                    ),
+                    "pull_request_url": (
+                        execution.pull_request_url
+                    ),
+                    "adapter_type": setup_plan.adapter_type,
+                    "framework_name": setup_plan.framework_name,
+                    "spec_path": setup_plan.spec_path,
+                    "ci_secret_name": provisioning.secret_name,
+                    "ci_variable_name": provisioning.variable_name,
+                    "ci_token_id": provisioning.token_id,
+                    "ci_tokens_rotated": (
+                        provisioning.rotated_existing_tokens
+                    ),
+                },
+            )
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "POST-SETUP FAILURE: final database update failed."
+            )
+
+            return Response(
+                {
+                    "detail": (
+                        "Setup PR was created, but the final database "
+                        "update failed."
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         return Response(
             {
