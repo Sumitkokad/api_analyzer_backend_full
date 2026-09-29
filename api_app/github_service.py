@@ -1,1256 +1,894 @@
+"""
+Automatic repository setup planning.
+
+This module converts repository scan results into a reviewable setup plan.
+It does not call GitHub and does not modify repositories.
+
+The GitHub write layer can consume the resulting plan to create one setup
+branch and one setup pull request. Framework-specific contract generation
+remains inside the resolved adapter. This service only validates and wires
+that adapter plan into repository configuration.
+"""
+
 from __future__ import annotations
 
-import base64
-import hashlib
-import time
+from dataclasses import dataclass, field
+import json
+import os
+import re
+from textwrap import indent
 from typing import Any, Mapping
-from urllib.parse import quote
-
-import jwt
-import requests
-from django.conf import settings
+from urllib.parse import urlparse
 
 
-class GitHubConfigurationError(RuntimeError):
-    """Raised when GitHub App configuration is missing or invalid."""
+@dataclass(frozen=True)
+class SetupFile:
+    """A file that should be created or updated by the setup PR."""
+
+    path: str
+    content: str
 
 
-class GitHubAPIError(RuntimeError):
-    """Raised when GitHub returns an unsuccessful API response."""
+@dataclass(frozen=True)
+class SetupPlan:
+    """Complete reviewable setup plan for a repository."""
 
-    def __init__(
+    repository: str
+    base_branch: str
+
+    branch_name: str
+    pull_request_title: str
+    pull_request_body: str
+
+    files: tuple[SetupFile, ...]
+
+    adapter_type: str
+    framework_name: str
+    spec_path: str
+    generation_command: str
+
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    analyzer_action_ref: str = ""
+    analyzer_base_url: str = ""
+    project_id: str = ""
+    token_secret_name: str = "API_ANALYZER_TOKEN"
+
+
+class RepositorySetupService:
+    """
+    Build automatic API Analyzer onboarding plans.
+
+    Framework detection and generation are delegated to the adapter layer.
+    The setup service does not contain per-framework command branches.
+    """
+
+    DEFAULT_WORKFLOW_PATH = ".github/workflows/api-compatibility.yml"
+    DEFAULT_CONFIG_PATH = ".api-analyzer.yml"
+    SETUP_BRANCH_PREFIX = "api-analyzer/setup"
+
+    DEFAULT_ANALYZER_ACTION_REF = os.getenv(
+        "API_ANALYZER_ACTION_REF",
+        "Sumitkokad/api_analyzer_full/.github/actions/api-compatibility@main",
+    )
+    DEFAULT_ANALYZER_BASE_URL = os.getenv(
+        "API_ANALYZER_BASE_URL",
+        "https://api-analyzer-backend.onrender.com",
+    )
+    DEFAULT_TOKEN_SECRET_NAME = "API_ANALYZER_TOKEN"
+    DEFAULT_PROJECT_VARIABLE_NAME = "API_ANALYZER_PROJECT_ID"
+
+    _SECRET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    _ACTION_REF_PATTERN = re.compile(
+        r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[^@\s]+)?@[A-Za-z0-9_.-]+$"
+    )
+
+    def build_plan(
         self,
-        message: str,
-        status_code: int | None = None,
-    ):
-        super().__init__(message)
-        self.status_code = status_code
+        *,
+        repository: Mapping[str, Any],
+        adapter: Any,
+        base_branch: str | None = None,
+        spec_path: str | None = None,
+        project_id: str | int | None = None,
+        analyzer_base_url: str | None = None,
+        analyzer_action_ref: str | None = None,
+        token_secret_name: str | None = None,
+    ) -> SetupPlan:
+        """Build a setup PR plan for the detected repository."""
 
-
-class GitHubAppClient:
-    """Small server-side GitHub App client used by the onboarding flow."""
-
-    def __init__(self) -> None:
-        self.api_url = str(
-            getattr(
-                settings,
-                "GITHUB_API_URL",
-                "https://api.github.com",
-            )
-        ).rstrip("/")
-
-        self.api_version = str(
-            getattr(
-                settings,
-                "GITHUB_API_VERSION",
-                "2026-03-10",
-            )
+        repository_name = self._repository_name(repository)
+        branch = self._normalize_branch(
+            base_branch or repository.get("default_branch") or "main"
         )
 
-        self.timeout = float(
-            getattr(
-                settings,
-                "GITHUB_API_TIMEOUT_SECONDS",
-                15,
-            )
+        adapter_type = self._adapter_value(adapter, "adapter_type")
+        framework_name = self._adapter_value(
+            adapter,
+            "framework_name",
+            default=adapter_type,
+        )
+
+        repository_spec_path = self._repository_spec_path(repository)
+        resolved_spec_path = (
+            self._normalize_path(spec_path)
+            if spec_path
+            else repository_spec_path
+        ) or "openapi.json"
+
+        commit_sha = str(repository.get("commit_sha") or "").strip()
+        generation_plan = self._contract_generation_plan(
+            adapter=adapter,
+            repository=repository,
+            commit_sha=commit_sha,
+            spec_path=resolved_spec_path,
+            repository_spec_path=repository_spec_path,
+        )
+        generation_command = generation_plan["command"]
+
+        resolved_project_id = self._resolve_project_id(
+            repository=repository,
+            project_id=project_id,
+        )
+        resolved_analyzer_base_url = self._resolve_analyzer_base_url(
+            repository=repository,
+            analyzer_base_url=analyzer_base_url,
+        )
+        resolved_action_ref = self._resolve_action_ref(
+            repository=repository,
+            analyzer_action_ref=analyzer_action_ref,
+        )
+        resolved_token_secret = self._resolve_token_secret_name(
+            repository=repository,
+            token_secret_name=token_secret_name,
+        )
+
+        self._validate_analyzer_action_ref(resolved_action_ref)
+
+        workflow_content = self._build_workflow(
+            adapter_type=adapter_type,
+            framework_name=framework_name,
+            spec_path=resolved_spec_path,
+            generation_command=generation_command,
+            analyzer_action_ref=resolved_action_ref,
+            analyzer_base_url=resolved_analyzer_base_url,
+            project_id=resolved_project_id,
+            token_secret_name=resolved_token_secret,
+            contract_source=str(generation_plan.get("source") or "generated"),
+            generation_plan=generation_plan,
+        )
+
+        config_content = self._build_config(
+            adapter_type=adapter_type,
+            framework_name=framework_name,
+            spec_path=resolved_spec_path,
+            analyzer_base_url=resolved_analyzer_base_url,
+            project_id=resolved_project_id,
+            analyzer_action_ref=resolved_action_ref,
+            token_secret_name=resolved_token_secret,
+            generation_plan=generation_plan,
+        )
+
+        files = (
+            SetupFile(path=self.DEFAULT_CONFIG_PATH, content=config_content),
+            SetupFile(path=self.DEFAULT_WORKFLOW_PATH, content=workflow_content),
+        )
+
+        branch_name = self._setup_branch_name(adapter_type=adapter_type)
+        pull_request_title = "chore: configure API compatibility analysis"
+
+        pull_request_body = self._build_pull_request_body(
+            repository_name=repository_name,
+            framework_name=framework_name,
+            adapter_type=adapter_type,
+            spec_path=resolved_spec_path,
+            generation_command=generation_command,
+            analyzer_action_ref=resolved_action_ref,
+            token_secret_name=resolved_token_secret,
+            contract_source=str(generation_plan.get("source") or "generated"),
+        )
+
+        warnings = self._collect_warnings(
+            repository=repository,
+            spec_path=resolved_spec_path,
+            project_id=resolved_project_id,
+            analyzer_base_url=resolved_analyzer_base_url,
+            analyzer_action_ref=resolved_action_ref,
+        )
+
+        metadata = {
+            "setup_mode": "automatic",
+            "review_required": True,
+            "framework_agnostic": True,
+            "repository": repository_name,
+            "base_branch": branch,
+            "project_id": resolved_project_id,
+            "analyzer_base_url": resolved_analyzer_base_url,
+            "analyzer_action_ref": resolved_action_ref,
+            "token_secret_name": resolved_token_secret,
+            "project_variable_name": self.DEFAULT_PROJECT_VARIABLE_NAME,
+            "contract_generation": generation_plan,
+            "contract_source": str(generation_plan.get("source") or "generated"),
+            "setup_branch_prefix": self.SETUP_BRANCH_PREFIX,
+        }
+
+        return SetupPlan(
+            repository=repository_name,
+            base_branch=branch,
+            branch_name=branch_name,
+            pull_request_title=pull_request_title,
+            pull_request_body=pull_request_body,
+            files=files,
+            adapter_type=adapter_type,
+            framework_name=framework_name,
+            spec_path=resolved_spec_path,
+            generation_command=generation_command,
+            warnings=tuple(warnings),
+            metadata=metadata,
+            analyzer_action_ref=resolved_action_ref,
+            analyzer_base_url=resolved_analyzer_base_url,
+            project_id=resolved_project_id or "",
+            token_secret_name=resolved_token_secret,
         )
 
     @staticmethod
-    def _required_setting(name: str) -> str:
-        value = str(
-            getattr(settings, name, "") or ""
-        ).strip()
-
-        if not value:
-            raise GitHubConfigurationError(
-                f"{name} is not configured."
-            )
-
-        return value
-
-    @property
-    def app_id(self) -> int:
-        raw = self._required_setting(
-            "GITHUB_APP_ID"
-        )
-
-        try:
-            value = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise GitHubConfigurationError(
-                "GITHUB_APP_ID must be an integer."
-            ) from exc
-
-        if value <= 0:
-            raise GitHubConfigurationError(
-                "GITHUB_APP_ID must be greater than zero."
-            )
-
-        return value
-
-    @property
-    def app_slug(self) -> str:
-        return self._required_setting(
-            "GITHUB_APP_SLUG"
-        )
-
-    @property
-    def client_id(self) -> str:
-        return self._required_setting(
-            "GITHUB_APP_CLIENT_ID"
-        )
-
-    @property
-    def client_secret(self) -> str:
-        return self._required_setting(
-            "GITHUB_APP_CLIENT_SECRET"
-        )
-
-    @property
-    def private_key(self) -> str:
-        value = self._required_setting(
-            "GITHUB_APP_PRIVATE_KEY"
-        )
-
-        # dotenv commonly stores multiline PEM values as literal
-        # \\n escapes. Convert them back before signing the JWT.
-        return value.replace("\\n", "\n").strip()
-
-    @property
-    def callback_url(self) -> str:
-        return self._required_setting(
-            "GITHUB_APP_CALLBACK_URL"
-        )
-
-    def _headers(
-        self,
-        authorization: str,
-    ) -> dict[str, str]:
-        return {
-            "Accept": "application/vnd.github+json",
-            "Authorization": authorization,
-            "X-GitHub-Api-Version": self.api_version,
-            "User-Agent": "API-Analyzer-GitHub-App",
-        }
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        authorization: str,
-        params: Mapping[str, Any] | None = None,
-        json: Mapping[str, Any] | None = None,
-    ) -> Any:
-        url = f"{self.api_url}{path}"
-
-        try:
-            response = requests.request(
-                method,
-                url,
-                headers=self._headers(authorization),
-                params=params,
-                json=json,
-                timeout=self.timeout,
-            )
-        except requests.RequestException as exc:
-            raise GitHubAPIError(
-                "Unable to reach GitHub API."
-            ) from exc
-
-        if not response.ok:
-            # Do not expose response bodies because GitHub can include
-            # sensitive details in error messages.
-            raise GitHubAPIError(
-                (
-                    "GitHub API request failed with "
-                    f"status {response.status_code}."
-                ),
-                status_code=response.status_code,
-            )
-
-        if (
-            response.status_code == 204
-            or not response.content
+    def _repository_name(repository: Mapping[str, Any]) -> str:
+        for key in (
+            "repository_full_name",
+            "full_name",
+            "repository",
+            "name",
         ):
-            return {}
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise GitHubAPIError(
-                "GitHub API returned an invalid JSON response.",
-                status_code=response.status_code,
-            ) from exc
-
-        return data
-
-    def app_jwt(self) -> str:
-        """Create the short-lived JWT used to authenticate as the GitHub App."""
-        now = int(time.time())
-
-        payload = {
-            "iat": now - 60,
-            "exp": now + (9 * 60),
-            "iss": str(self.app_id),
-        }
-
-        try:
-            token = jwt.encode(
-                payload,
-                self.private_key,
-                algorithm="RS256",
-            )
-        except Exception as exc:
-            raise GitHubConfigurationError(
-                "Unable to generate the GitHub App JWT."
-            ) from exc
-
-        return str(token)
-
-    def get_installation(
-        self,
-        installation_id: int,
-    ) -> dict[str, Any]:
-        """Verify that an installation belongs to this GitHub App."""
-        if installation_id <= 0:
-            raise GitHubAPIError(
-                "Invalid GitHub installation id."
-            )
-
-        data = self._request(
-            "GET",
-            f"/app/installations/{installation_id}",
-            authorization=f"Bearer {self.app_jwt()}",
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub installation response is invalid."
-            )
-
-        return data
-
-    def exchange_user_code(
-        self,
-        code: str,
-    ) -> dict[str, Any]:
-        """Exchange the GitHub App OAuth callback code for a user token."""
-        code = code.strip()
-
-        if not code:
-            raise GitHubAPIError(
-                "GitHub OAuth code is missing."
-            )
-
-        try:
-            response = requests.post(
-                "https://github.com/login/oauth/access_token",
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "API-Analyzer-GitHub-App",
-                },
-                data={
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "code": code,
-                    "redirect_uri": self.callback_url,
-                },
-                timeout=self.timeout,
-            )
-        except requests.RequestException as exc:
-            raise GitHubAPIError(
-                "Unable to reach GitHub OAuth endpoint."
-            ) from exc
-
-        if not response.ok:
-            raise GitHubAPIError(
-                "GitHub OAuth token exchange failed.",
-                status_code=response.status_code,
-            )
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise GitHubAPIError(
-                "GitHub OAuth returned an invalid JSON response.",
-                status_code=response.status_code,
-            ) from exc
-
-        if (
-            not isinstance(data, dict)
-            or data.get("error")
-        ):
-            raise GitHubAPIError(
-                "GitHub OAuth authorization was not completed."
-            )
-
-        access_token = data.get(
-            "access_token"
-        )
-
-        if not access_token:
-            raise GitHubAPIError(
-                "GitHub OAuth did not return an access token."
-            )
-
-        return data
-
-    def get_authenticated_user(
-        self,
-        user_access_token: str,
-    ) -> dict[str, Any]:
-        data = self._request(
-            "GET",
-            "/user",
-            authorization=(
-                f"Bearer {user_access_token}"
-            ),
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub user response is invalid."
-            )
-
-        return data
-
-    def get_user_installations(
-        self,
-        user_access_token: str,
-    ) -> list[dict[str, Any]]:
-        """Get installations visible to the authenticated GitHub user."""
-        data = self._request(
-            "GET",
-            "/user/installations",
-            authorization=(
-                f"Bearer {user_access_token}"
-            ),
-            params={
-                "per_page": 100,
-                "page": 1,
-            },
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub installations response is invalid."
-            )
-
-        installations = data.get(
-            "installations",
-            [],
-        )
-
-        if not isinstance(installations, list):
-            raise GitHubAPIError(
-                "GitHub installations response is invalid."
-            )
-
-        return [
-            item
-            for item in installations
-            if isinstance(item, dict)
-        ]
-
-    def get_user_installation(
-        self,
-        username: str,
-    ) -> dict[str, Any]:
-        """
-        Get this GitHub App's installation for a specific GitHub user.
-        """
-        username = str(username or "").strip()
-
-        if not username:
-            raise GitHubAPIError(
-                "GitHub username is missing."
-            )
-
-        encoded_username = quote(
-            username,
-            safe="",
-        )
-
-        data = self._request(
-            "GET",
-            f"/users/{encoded_username}/installation",
-            authorization=f"Bearer {self.app_jwt()}",
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub user installation response is invalid."
-            )
-
-        return data
-
-    def verify_user_has_installation(
-        self,
-        *,
-        user_access_token: str,
-        installation_id: int,
-    ) -> dict[str, Any]:
-        installations = self.get_user_installations(
-            user_access_token
-        )
-
-        for installation in installations:
-            try:
-                current_id = int(
-                    installation.get("id")
-                )
-            except (TypeError, ValueError):
-                continue
-
-            if current_id == installation_id:
-                return installation
-
-        raise GitHubAPIError(
-            "The authenticated GitHub user does not have "
-            "this app installation."
-        )
-
-    def create_installation_token(
-        self,
-        installation_id: int,
-    ) -> dict[str, Any]:
-        data = self._request(
-            "POST",
-            (
-                f"/app/installations/"
-                f"{installation_id}/access_tokens"
-            ),
-            authorization=(
-                f"Bearer {self.app_jwt()}"
-            ),
-        )
-
-        if (
-            not isinstance(data, dict)
-            or not data.get("token")
-        ):
-            raise GitHubAPIError(
-                "GitHub did not return an installation access token."
-            )
-
-        return data
-
-    def list_installation_repositories(
-        self,
-        installation_token: str,
-        *,
-        page: int = 1,
-        per_page: int = 100,
-    ) -> dict[str, Any]:
-        page = max(
-            1,
-            min(int(page), 1000),
-        )
-
-        per_page = max(
-            1,
-            min(int(per_page), 100),
-        )
-
-        data = self._request(
-            "GET",
-            "/installation/repositories",
-            authorization=(
-                f"Bearer {installation_token}"
-            ),
-            params={
-                "page": page,
-                "per_page": per_page,
-            },
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub repositories response is invalid."
-            )
-
-        repositories = data.get(
-            "repositories",
-            [],
-        )
-
-        if not isinstance(repositories, list):
-            raise GitHubAPIError(
-                "GitHub repositories response is invalid."
-            )
-
-        data["repositories"] = [
-            repo
-            for repo in repositories
-            if isinstance(repo, dict)
-        ]
-
-        return data
-
-    def get_repository(
-        self,
-        installation_token: str,
-        repository_full_name: str,
-    ) -> dict[str, Any]:
-        parts = (
-            repository_full_name
-            .strip()
-            .split("/", 1)
-        )
-
-        if (
-            len(parts) != 2
-            or not all(parts)
-        ):
-            raise GitHubAPIError(
-                "repository_full_name must use the "
-                "owner/repository format."
-            )
-
-        owner, repo = parts
-
-        data = self._request(
-            "GET",
-            f"/repos/{owner}/{repo}",
-            authorization=(
-                f"Bearer {installation_token}"
-            ),
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub repository response is invalid."
-            )
-
-        return data
-
-    def get_repository_tree(
-        self,
-        installation_token: str,
-        repository_full_name: str,
-        *,
-        tree_ref: str,
-        recursive: bool = True,
-    ) -> dict[str, Any]:
-        """
-        Read the repository Git tree for a branch/tag/commit ref.
-
-        The scanner uses this endpoint instead of recursively walking
-        directory-by-directory because GitHub's Contents API is limited
-        to 1,000 entries per directory.
-        """
-        parts = (
-            repository_full_name
-            .strip()
-            .split("/", 1)
-        )
-
-        if len(parts) != 2 or not all(parts):
-            raise GitHubAPIError(
-                "repository_full_name must use the "
-                "owner/repository format."
-            )
-
-        tree_ref = str(tree_ref or "").strip()
-        if not tree_ref:
-            raise GitHubAPIError("tree_ref is required.")
-
-        owner, repo = parts
-
-        data = self._request(
-            "GET",
-            f"/repos/{owner}/{repo}/git/trees/{quote(tree_ref, safe='')}",
-            authorization=(
-                f"Bearer {installation_token}"
-            ),
-            params={
-                "recursive": "1" if recursive else None,
-            },
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub repository tree response is invalid."
-            )
-
-        tree = data.get("tree", [])
-        if not isinstance(tree, list):
-            raise GitHubAPIError(
-                "GitHub repository tree response is invalid."
-            )
-
-        data["tree"] = [
-            item
-            for item in tree
-            if isinstance(item, dict)
-        ]
-
-        return data
-
-    def get_repository_file(
-        self,
-        installation_token: str,
-        repository_full_name: str,
-        path: str,
-        *,
-        ref: str | None = None,
-    ) -> dict[str, Any]:
-        """
-        Read one repository file through GitHub's Contents API.
-
-        The method returns both the GitHub metadata and decoded UTF-8
-        text when GitHub provides the file as base64 content.
-        """
-        parts = (
-            repository_full_name
-            .strip()
-            .split("/", 1)
-        )
-
-        if len(parts) != 2 or not all(parts):
-            raise GitHubAPIError(
-                "repository_full_name must use the "
-                "owner/repository format."
-            )
-
-        path = str(path or "").strip().lstrip("/")
-        if not path:
-            raise GitHubAPIError("Repository file path is required.")
-
-        owner, repo = parts
-
-        params = {}
-        if ref:
-            params["ref"] = str(ref).strip()
-
-        data = self._request(
-            "GET",
-            f"/repos/{owner}/{repo}/contents/{quote(path, safe='/')}",
-            authorization=(
-                f"Bearer {installation_token}"
-            ),
-            params=params or None,
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub repository file response is invalid."
-            )
-
-        if data.get("type") != "file":
-            raise GitHubAPIError(
-                "GitHub repository path is not a file."
-            )
-
-        raw_content = data.get("content") or ""
-        encoding = str(data.get("encoding") or "").lower()
-
-        decoded_text = ""
-        if raw_content and encoding == "base64":
-            try:
-                decoded_text = base64.b64decode(
-                    raw_content,
-                    validate=False,
-                ).decode(
-                    "utf-8",
-                    errors="replace",
-                )
-            except (ValueError, TypeError):
-                raise GitHubAPIError(
-                    "GitHub returned invalid file content."
-                )
-
-        return {
-            "path": data.get("path") or path,
-            "sha": data.get("sha") or "",
-            "size": data.get("size"),
-            "html_url": data.get("html_url") or "",
-            "encoding": encoding,
-            "content": decoded_text,
-            "download_url": data.get("download_url") or "",
-        }
-    def create_branch(
-        self,
-        installation_token: str,
-        repository_full_name: str,
-        *,
-        branch_name: str,
-        from_sha: str | None = None,
-        from_branch: str | None = None,
-    ) -> dict[str, Any]:
-        """
-        Create a new branch from an exact commit SHA or an existing branch.
-
-        The method never overwrites an existing branch.
-        """
-
-        parts = (
-            repository_full_name
-            .strip()
-            .split("/", 1)
-        )
-
-        if len(parts) != 2 or not all(parts):
-            raise GitHubAPIError(
-                "repository_full_name must use the "
-                "owner/repository format."
-            )
-
-        branch_name = (
-            str(branch_name or "")
-            .strip()
-            .removeprefix("refs/heads/")
-        )
-
-        if not branch_name:
-            raise GitHubAPIError(
-                "branch_name is required."
-            )
-
-        if branch_name.startswith("/") or ".." in branch_name:
-            raise GitHubAPIError(
-                "Invalid branch_name."
-            )
-
-        from_sha = str(from_sha or "").strip()
-        from_branch = str(from_branch or "").strip()
-
-        if bool(from_sha) == bool(from_branch):
-            raise GitHubAPIError(
-                "Provide exactly one of from_sha or from_branch."
-            )
-
-        owner, repo = parts
-
-        source_sha = from_sha
-
-        if from_branch:
-            ref_data = self._request(
-                "GET",
-                (
-                    f"/repos/{owner}/{repo}/git/ref/heads/"
-                    f"{quote(from_branch, safe='/')}"
-                ),
-                authorization=(
-                    f"Bearer {installation_token}"
-                ),
-            )
-
-            if not isinstance(ref_data, dict):
-                raise GitHubAPIError(
-                    "GitHub branch reference response is invalid."
-                )
-
-            object_data = ref_data.get("object") or {}
-
-            if not isinstance(object_data, dict):
-                raise GitHubAPIError(
-                    "GitHub branch reference response is invalid."
-                )
-
-            source_sha = str(
-                object_data.get("sha") or ""
-            ).strip()
-
-            if not source_sha:
-                raise GitHubAPIError(
-                    "GitHub branch reference does not contain a SHA."
-                )
-
-        data = self._request(
-            "POST",
-            f"/repos/{owner}/{repo}/git/refs",
-            authorization=(
-                f"Bearer {installation_token}"
-            ),
-            json={
-                "ref": f"refs/heads/{branch_name}",
-                "sha": source_sha,
-            },
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub branch creation response is invalid."
-            )
-
-        return data
-
-    def create_or_update_repository_file(
-        self,
-        installation_token: str,
-        repository_full_name: str,
-        *,
-        path: str,
-        content: str,
-        branch: str,
-        commit_message: str,
-    ) -> dict[str, Any]:
-        """
-        Create or update one repository file on a branch.
-
-        Existing files are updated using their current Git blob SHA.
-        New files are created without a SHA.
-        """
-
-        parts = (
-            repository_full_name
-            .strip()
-            .split("/", 1)
-        )
-
-        if len(parts) != 2 or not all(parts):
-            raise GitHubAPIError(
-                "repository_full_name must use the "
-                "owner/repository format."
-            )
-
-        path = str(path or "").strip().lstrip("/")
-
-        if not path:
-            raise GitHubAPIError(
-                "Repository file path is required."
-            )
-
-        branch = str(branch or "").strip()
-
-        if not branch:
-            raise GitHubAPIError(
-                "branch is required."
-            )
-
-        commit_message = str(
-            commit_message or ""
-        ).strip()
-
-        if not commit_message:
-            raise GitHubAPIError(
-                "commit_message is required."
-            )
-
-        if not isinstance(content, str):
-            raise GitHubAPIError(
-                "Repository file content must be text."
-            )
-
-        owner, repo = parts
-
-        existing_sha: str | None = None
-
-        try:
-            existing = self.get_repository_file(
-                installation_token,
-                repository_full_name,
-                path,
-                ref=branch,
-            )
-
-            existing_sha = str(
-                existing.get("sha") or ""
-            ).strip() or None
-
-        except GitHubAPIError as exc:
-            if exc.status_code != 404:
-                raise
-
-        encoded_content = base64.b64encode(
-            content.encode("utf-8")
-        ).decode("ascii")
-
-        payload: dict[str, Any] = {
-            "message": commit_message,
-            "content": encoded_content,
-            "branch": branch,
-        }
-
-        if existing_sha:
-            payload["sha"] = existing_sha
-
-        data = self._request(
-            "PUT",
-            (
-                f"/repos/{owner}/{repo}/contents/"
-                f"{quote(path, safe='/')}"
-            ),
-            authorization=(
-                f"Bearer {installation_token}"
-            ),
-            json=payload,
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub file write response is invalid."
-            )
-
-        return data
-
-    def create_pull_request(
-        self,
-        installation_token: str,
-        repository_full_name: str,
-        *,
-        title: str,
-        head: str,
-        base: str,
-        body: str = "",
-    ) -> dict[str, Any]:
-        """
-        Create a pull request from head into base.
-        """
-
-        parts = (
-            repository_full_name
-            .strip()
-            .split("/", 1)
-        )
-
-        if len(parts) != 2 or not all(parts):
-            raise GitHubAPIError(
-                "repository_full_name must use the "
-                "owner/repository format."
-            )
-
-        title = str(title or "").strip()
-        head = str(head or "").strip()
-        base = str(base or "").strip()
-        body = str(body or "")
-
-        if not title:
-            raise GitHubAPIError(
-                "Pull request title is required."
-            )
-
-        if not head:
-            raise GitHubAPIError(
-                "Pull request head is required."
-            )
-
-        if not base:
-            raise GitHubAPIError(
-                "Pull request base is required."
-            )
-
-        owner, repo = parts
-
-        data = self._request(
-            "POST",
-            f"/repos/{owner}/{repo}/pulls",
-            authorization=(
-                f"Bearer {installation_token}"
-            ),
-            json={
-                "title": title,
-                "head": head,
-                "base": base,
-                "body": body,
-            },
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub pull request response is invalid."
-            )
-
-        return data
+            value = repository.get(key)
+            if value:
+                return str(value).strip()
+
+        raise ValueError("Repository name is required to build a setup plan.")
 
     @staticmethod
-    def _validate_actions_name(
-        name: str,
+    def _adapter_value(
+        adapter: Any,
+        attribute: str,
         *,
-        kind: str,
+        default: str | None = None,
     ) -> str:
-        """
-        Validate a GitHub Actions secret or variable name.
-        """
-        normalized = str(name or "").strip()
+        value = getattr(adapter, attribute, None)
+        if value:
+            return str(value).strip()
+        if default is not None:
+            return default
+        raise ValueError(
+            f"Adapter does not provide required attribute '{attribute}'."
+        )
 
+    @staticmethod
+    def _normalize_branch(branch: str) -> str:
+        normalized = str(branch).strip()
         if not normalized:
-            raise GitHubAPIError(
-                f"GitHub Actions {kind} name is required."
-            )
-
-        if normalized.startswith("GITHUB_"):
-            raise GitHubAPIError(
-                f"GitHub Actions {kind} name cannot start with GITHUB_."
-            )
-
-        if not all(
-            character.isascii()
-            and (
-                character.isalnum()
-                or character == "_"
-            )
-            for character in normalized
-        ):
-            raise GitHubAPIError(
-                f"GitHub Actions {kind} name may contain only "
-                "ASCII letters, numbers, and underscores."
-            )
-
+            return "main"
+        if any(char in normalized for char in "\r\n"):
+            raise ValueError("Repository branch cannot contain newlines.")
         return normalized
 
     @staticmethod
-    def _repository_parts(
-        repository_full_name: str,
-    ) -> tuple[str, str]:
-        parts = (
-            str(repository_full_name or "")
-            .strip()
-            .split("/", 1)
-        )
+    def _normalize_path(path: str) -> str:
+        normalized = str(path).strip().replace("\\", "/")
 
-        if len(parts) != 2 or not all(parts):
-            raise GitHubAPIError(
-                "repository_full_name must use the "
-                "owner/repository format."
-            )
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
 
-        return parts[0], parts[1]
+        normalized = normalized.lstrip("/")
 
-    def get_actions_public_key(
+        if not normalized or normalized == ".":
+            raise ValueError("Contract path cannot be empty.")
+
+        parts = normalized.split("/")
+        if ".." in parts:
+            raise ValueError("Contract path cannot escape the repository root.")
+
+        if any(char in normalized for char in "\r\n"):
+            raise ValueError("Contract path cannot contain newlines.")
+
+        return normalized
+
+    def _repository_spec_path(
         self,
-        installation_token: str,
-        repository_full_name: str,
-    ) -> dict[str, str]:
-        """
-        Get the repository Actions public key required for encrypting
-        repository-level Actions secrets.
-        """
-        owner, repo = self._repository_parts(
-            repository_full_name
-        )
-
-        data = self._request(
-            "GET",
-            f"/repos/{owner}/{repo}/actions/secrets/public-key",
-            authorization=f"Bearer {installation_token}",
-        )
-
-        if not isinstance(data, dict):
-            raise GitHubAPIError(
-                "GitHub Actions public-key response is invalid."
-            )
-
-        key = str(
-            data.get("key") or ""
-        ).strip()
-
-        key_id = str(
-            data.get("key_id") or ""
-        ).strip()
-
-        if not key or not key_id:
-            raise GitHubAPIError(
-                "GitHub Actions public-key response is incomplete."
-            )
-
-        return {
-            "key": key,
-            "key_id": key_id,
-        }
+        repository: Mapping[str, Any],
+    ) -> str | None:
+        value = repository.get("spec_path")
+        if not value:
+            return None
+        return self._normalize_path(str(value))
 
     @staticmethod
-    def _encrypt_actions_secret(
-        public_key: str,
-        secret_value: str,
-    ) -> str:
-        """
-        Encrypt a GitHub Actions secret using the sealed-box primitive
-        expected by GitHub's Actions secrets API.
-
-        PyNaCl is imported lazily so existing GitHub operations do not
-        require this dependency until a repository secret is configured.
-        """
-        try:
-            from nacl.public import (
-                PublicKey,
-                SealedBox,
-            )
-        except ImportError as exc:
-            raise GitHubConfigurationError(
-                "PyNaCl is required to configure GitHub Actions secrets. "
-                "Install it with: pip install pynacl."
-            ) from exc
-
-        try:
-            public_key_bytes = base64.b64decode(
-                str(public_key).encode("ascii"),
-                validate=True,
-            )
-
-            encrypted = SealedBox(
-                PublicKey(public_key_bytes)
-            ).encrypt(
-                str(secret_value).encode("utf-8")
-            )
-
-            return base64.b64encode(
-                encrypted
-            ).decode("ascii")
-
-        except (ValueError, TypeError) as exc:
-            raise GitHubAPIError(
-                "GitHub Actions public key is invalid."
-            ) from exc
-
-    def create_or_update_actions_secret(
-        self,
-        installation_token: str,
-        repository_full_name: str,
+    def _contract_generation_plan(
         *,
-        secret_name: str,
-        secret_value: str,
+        adapter: Any,
+        repository: Mapping[str, Any],
+        commit_sha: str,
+        spec_path: str,
+        repository_spec_path: str | None,
     ) -> dict[str, Any]:
+        """Resolve how the compatibility workflow obtains the API contract.
+
+        If repository scanning found a committed OpenAPI/Swagger contract and
+        the selected ``spec_path`` points to that same file, use the file
+        directly. This avoids incorrectly running a framework generator for
+        repositories whose API contract is already committed.
+
+        Otherwise the resolved framework adapter provides the generation plan.
         """
-        Create or replace one repository-level GitHub Actions secret.
 
-        The plaintext secret is never returned by this method.
-        """
-        name = self._validate_actions_name(
-            secret_name,
-            kind="secret",
-        )
-
-        if secret_value is None:
-            raise GitHubAPIError(
-                "GitHub Actions secret value is required."
-            )
-
-        if not isinstance(secret_value, str):
-            raise GitHubAPIError(
-                "GitHub Actions secret value must be text."
-            )
-
-        repository_key = self.get_actions_public_key(
-            installation_token,
-            repository_full_name,
-        )
-
-        encrypted_value = self._encrypt_actions_secret(
-            repository_key["key"],
-            secret_value,
-        )
-
-        owner, repo = self._repository_parts(
-            repository_full_name
-        )
-
-        self._request(
-            "PUT",
-            (
-                f"/repos/{owner}/{repo}/actions/secrets/"
-                f"{quote(name, safe='')}"
-            ),
-            authorization=f"Bearer {installation_token}",
-            json={
-                "encrypted_value": encrypted_value,
-                "key_id": repository_key["key_id"],
-            },
-        )
-
-        return {
-            "name": name,
-            "configured": True,
-        }
-
-    def create_or_update_actions_variable(
-        self,
-        installation_token: str,
-        repository_full_name: str,
-        *,
-        variable_name: str,
-        value: str,
-    ) -> dict[str, Any]:
-        """
-        Create or update one repository-level GitHub Actions variable.
-
-        Existing variables use PATCH. If GitHub reports 404, the method
-        creates the variable with POST.
-        """
-        name = self._validate_actions_name(
-            variable_name,
-            kind="variable",
-        )
-
-        if value is None:
-            raise GitHubAPIError(
-                "GitHub Actions variable value is required."
-            )
-
-        if not isinstance(value, str):
-            raise GitHubAPIError(
-                "GitHub Actions variable value must be text."
-            )
-
-        owner, repo = self._repository_parts(
-            repository_full_name
-        )
-
-        variable_path = (
-            f"/repos/{owner}/{repo}/actions/variables/"
-            f"{quote(name, safe='')}"
-        )
-
-        try:
-            data = self._request(
-                "PATCH",
-                variable_path,
-                authorization=f"Bearer {installation_token}",
-                json={
-                    "name": name,
-                    "value": value,
-                },
-            )
-        except GitHubAPIError as exc:
-            if exc.status_code != 404:
-                raise
-
-            data = self._request(
-                "POST",
-                f"/repos/{owner}/{repo}/actions/variables",
-                authorization=f"Bearer {installation_token}",
-                json={
-                    "name": name,
-                    "value": value,
-                },
-            )
-
+        if repository_spec_path and spec_path == repository_spec_path:
             return {
-                "name": name,
-                "configured": True,
-                "created": True,
-                "response": (
-                    data
-                    if isinstance(data, dict)
-                    else {}
-                ),
+                "command": "",
+                "source": "committed_file",
+                "path": repository_spec_path,
+                "language": "",
+                "package_manager": "",
+                "dependency_files": [],
+                "working_directory": ".",
+                "install_command": "",
+                "environment": {},
+                "adapter_name": "committed-contract",
+                "adapter_version": "1",
             }
 
-        return {
-            "name": name,
-            "configured": True,
-            "created": False,
-            "response": (
-                data
-                if isinstance(data, dict)
-                else {}
-            ),
+        try:
+            plan = adapter.generate_contract(
+                repository,
+                commit_sha=commit_sha or ("0" * 40),
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Unable to obtain contract generation plan from adapter: "
+                f"{exc}"
+            ) from exc
+
+        command = getattr(plan, "command", None)
+        if not command:
+            raise ValueError(
+                "Adapter contract generation plan did not provide a command."
+            )
+
+        result: dict[str, Any] = {
+            "command": str(command).strip(),
+            "source": "generated",
+            "adapter_name": str(
+                getattr(plan, "adapter_name", None)
+                or getattr(adapter, "adapter_type", None)
+                or "customer-adapter"
+            ).strip(),
+            "adapter_version": str(
+                getattr(plan, "adapter_version", None)
+                or getattr(adapter, "version", None)
+                or "1"
+            ).strip(),
         }
 
+        plan_warnings = getattr(plan, "warnings", None)
+        if plan_warnings is not None:
+            if isinstance(plan_warnings, (list, tuple, set)):
+                result["warnings"] = [
+                    str(item).strip()
+                    for item in plan_warnings
+                    if str(item).strip()
+                ]
+            elif str(plan_warnings).strip():
+                result["warnings"] = [str(plan_warnings).strip()]
 
-def hash_install_state(
-    state: str,
-) -> str:
-    return hashlib.sha256(
-        state.encode("utf-8")
-    ).hexdigest()
+        for attribute in (
+            "language",
+            "package_manager",
+            "dependency_files",
+            "working_directory",
+            "install_command",
+            "environment",
+        ):
+            value = getattr(plan, attribute, None)
+            if value is not None:
+                if attribute == "dependency_files" and isinstance(
+                    value, (list, tuple, set)
+                ):
+                    value = [str(item) for item in value]
+                elif attribute == "environment" and isinstance(value, Mapping):
+                    value = {
+                        str(key): str(item)
+                        for key, item in value.items()
+                    }
+                else:
+                    value = str(value).strip()
+                result[attribute] = value
 
+        return result
 
-__all__ = [
-    "GitHubAPIError",
-    "GitHubAppClient",
-    "GitHubConfigurationError",
-    "hash_install_state",
-]
+    def _resolve_project_id(
+        self,
+        *,
+        repository: Mapping[str, Any],
+        project_id: str | int | None,
+    ) -> str | None:
+        value = project_id if project_id is not None else repository.get("project_id")
+        if value is None or str(value).strip() == "":
+            return None
+        return str(value).strip()
+
+    def _resolve_analyzer_base_url(
+        self,
+        *,
+        repository: Mapping[str, Any],
+        analyzer_base_url: str | None,
+    ) -> str:
+        value = (
+            analyzer_base_url
+            or repository.get("analyzer_base_url")
+            or repository.get("api_analyzer_base_url")
+            or self.DEFAULT_ANALYZER_BASE_URL
+        )
+        return self._normalize_base_url(str(value))
+
+    def _resolve_action_ref(
+        self,
+        *,
+        repository: Mapping[str, Any],
+        analyzer_action_ref: str | None,
+    ) -> str:
+        value = (
+            analyzer_action_ref
+            or repository.get("analyzer_action_ref")
+            or self.DEFAULT_ANALYZER_ACTION_REF
+        )
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError("API Analyzer action reference cannot be empty.")
+        if any(char in normalized for char in "\r\n"):
+            raise ValueError("API Analyzer action reference cannot contain newlines.")
+        return normalized
+
+    def _resolve_token_secret_name(
+        self,
+        *,
+        repository: Mapping[str, Any],
+        token_secret_name: str | None,
+    ) -> str:
+        value = (
+            token_secret_name
+            or repository.get("token_secret_name")
+            or self.DEFAULT_TOKEN_SECRET_NAME
+        )
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError("API Analyzer token secret name cannot be empty.")
+        if not self._SECRET_NAME_PATTERN.fullmatch(normalized):
+            raise ValueError(
+                "API Analyzer token secret name must contain only letters, "
+                "digits, and underscores and must not start with a digit."
+            )
+        return normalized
+
+    @staticmethod
+    def _normalize_base_url(value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            raise ValueError("API Analyzer base URL cannot be empty.")
+
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "API Analyzer base URL must be an absolute HTTP(S) URL."
+            )
+        return normalized
+
+    @classmethod
+    def _validate_analyzer_action_ref(cls, action_ref: str) -> None:
+        if not cls._ACTION_REF_PATTERN.fullmatch(action_ref):
+            raise ValueError(
+                "API Analyzer action reference must look like "
+                "'owner/repository/path@ref'."
+            )
+
+    @staticmethod
+    def _yaml_string(value: str) -> str:
+        """Return a YAML-safe JSON string literal."""
+        return json.dumps(str(value), ensure_ascii=False)
+
+    @classmethod
+    def _build_config(
+        cls,
+        *,
+        adapter_type: str,
+        framework_name: str,
+        spec_path: str,
+        analyzer_base_url: str,
+        project_id: str | None,
+        analyzer_action_ref: str,
+        token_secret_name: str,
+        generation_plan: Mapping[str, Any],
+    ) -> str:
+        project_value = (
+            str(project_id)
+            if project_id is not None
+            else "repository variable: API_ANALYZER_PROJECT_ID"
+        )
+
+        source_value = str(generation_plan.get("source") or "generated")
+
+        lines = [
+            "# API Analyzer configuration",
+            "# Generated automatically by API Analyzer.",
+            "# Review this file in the setup pull request before merging.",
+            "",
+            "api_analyzer:",
+            f"  adapter: {cls._yaml_string(adapter_type)}",
+            f"  framework: {cls._yaml_string(framework_name)}",
+            f"  spec_path: {cls._yaml_string(spec_path)}",
+            '  baseline_mode: "merge-base"',
+            f"  analyzer_base_url: {cls._yaml_string(analyzer_base_url)}",
+            f"  analyzer_action: {cls._yaml_string(analyzer_action_ref)}",
+            f"  project_id: {cls._yaml_string(project_value)}",
+            f"  token_secret: {cls._yaml_string(token_secret_name)}",
+            "",
+            "  contract_generation:",
+            f"    source: {cls._yaml_string(source_value)}",
+            f"    command: {cls._yaml_string(str(generation_plan['command']))}",
+        ]
+
+        for key in (
+            "language",
+            "package_manager",
+            "working_directory",
+            "install_command",
+        ):
+            value = generation_plan.get(key)
+            if value not in (None, ""):
+                lines.append(f"    {key}: {cls._yaml_string(str(value))}")
+
+        dependency_files = generation_plan.get("dependency_files")
+        if dependency_files:
+            lines.append("    dependency_files:")
+            for item in dependency_files:
+                lines.append(f"      - {cls._yaml_string(str(item))}")
+
+        environment = generation_plan.get("environment")
+        if environment:
+            lines.append("    environment:")
+            for key, value in environment.items():
+                lines.append(
+                    f"      {cls._yaml_string(str(key))}: "
+                    f"{cls._yaml_string(str(value))}"
+                )
+
+        warnings = generation_plan.get("warnings")
+        if warnings:
+            lines.append("    warnings:")
+            for warning in warnings:
+                lines.append(
+                    f"      - {cls._yaml_string(str(warning))}"
+                )
+
+        return "\n".join(lines) + "\n"
+
+    @classmethod
+    def _build_workflow(
+        cls,
+        *,
+        adapter_type: str,
+        framework_name: str,
+        spec_path: str,
+        generation_command: str,
+        analyzer_action_ref: str,
+        analyzer_base_url: str,
+        project_id: str | None,
+        token_secret_name: str,
+        contract_source: str = "generated",
+        generation_plan: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Build the repository-side compatibility workflow.
+
+        The workflow is technology-neutral. The resolved adapter supplies
+        contract-acquisition/runtime metadata, while the centralized action
+        performs the common BASE-vs-HEAD comparison and CI gate.
+
+        A committed contract uses an empty generation command and requires no
+        framework runtime. Generated contracts receive the adapter's runtime,
+        dependency, working-directory, installation, and environment plan.
+        """
+        plan = dict(generation_plan or {})
+        normalized_source = str(contract_source).strip() or "generated"
+
+        project_id_value = (
+            cls._yaml_string(str(project_id))
+            if project_id is not None
+            else "${{ vars.API_ANALYZER_PROJECT_ID }}"
+        )
+        token_value = "${{ secrets." + token_secret_name + " }}"
+        normalized_generation_command = str(
+            generation_command or ""
+        ).strip()
+
+        if normalized_source == "committed_file":
+            if normalized_generation_command:
+                raise ValueError(
+                    "Committed contract source cannot have a generation command."
+                )
+            generation_input = '          generate-command: ""'
+        elif normalized_generation_command:
+            generation_input = (
+                "          generate-command: |\n"
+                f"{indent(normalized_generation_command, '            ')}"
+            )
+        else:
+            raise ValueError(
+                "Generated contract source requires a non-empty generation command."
+            )
+
+        language = str(plan.get("language") or "").strip()
+        package_manager = str(plan.get("package_manager") or "").strip()
+        working_directory = str(plan.get("working_directory") or "").strip()
+        install_command = str(plan.get("install_command") or "").strip()
+        adapter_name = str(
+            plan.get("adapter_name") or adapter_type
+        ).strip()
+        adapter_version = str(
+            plan.get("adapter_version") or "1"
+        ).strip()
+
+        dependency_files = plan.get("dependency_files") or []
+        if isinstance(dependency_files, str):
+            dependency_files = [
+                line.strip()
+                for line in dependency_files.splitlines()
+                if line.strip()
+            ]
+        else:
+            dependency_files = [
+                str(item).strip()
+                for item in dependency_files
+                if str(item).strip()
+            ]
+
+        environment = plan.get("environment") or {}
+        if not isinstance(environment, Mapping):
+            environment = {}
+
+        environment_lines: list[str] = []
+        for key, value in environment.items():
+            normalized_key = str(key).strip()
+            normalized_value = str(value).replace("\r", "").replace("\n", "\\n")
+            if normalized_key:
+                environment_lines.append(
+                    f"{normalized_key}={normalized_value}"
+                )
+
+        warnings = plan.get("warnings") or []
+        if isinstance(warnings, str):
+            warnings = [
+                line.strip()
+                for line in warnings.splitlines()
+                if line.strip()
+            ]
+        else:
+            warnings = [
+                str(item).strip()
+                for item in warnings
+                if str(item).strip()
+            ]
+
+        input_lines = [
+            "          contract-source: " + cls._yaml_string(normalized_source),
+            "          language: " + cls._yaml_string(language),
+            "          package-manager: " + cls._yaml_string(package_manager),
+            "          working-directory: " + cls._yaml_string(working_directory),
+            "          install-command: " + cls._yaml_string(install_command),
+            "          adapter-name: " + cls._yaml_string(adapter_name),
+            "          adapter-version: " + cls._yaml_string(adapter_version),
+        ]
+
+        if dependency_files:
+            input_lines.append("          dependency-files: |")
+            input_lines.extend(f"            {item}" for item in dependency_files)
+        else:
+            input_lines.append('          dependency-files: ""')
+
+        if environment_lines:
+            input_lines.append("          environment: |")
+            input_lines.extend(f"            {item}" for item in environment_lines)
+        else:
+            input_lines.append('          environment: ""')
+
+        if warnings:
+            input_lines.append("          generator-warnings: |")
+            input_lines.extend(f"            {item}" for item in warnings)
+        else:
+            input_lines.append('          generator-warnings: ""')
+
+        action_inputs = "\n".join(input_lines)
+
+        return f"""# API Analyzer compatibility workflow
+# Generated automatically by API Analyzer.
+#
+# Adapter: {adapter_type}
+# Framework: {framework_name}
+# Contract: {spec_path}
+# Contract source: {normalized_source}
+
+name: API Compatibility
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  api-compatibility:
+    # The one-time setup PR adds the compatibility configuration itself.
+    # It must never be analyzed against its pre-setup merge-base.
+    if: ${{{{ !startsWith(github.head_ref, '{RepositorySetupService.SETUP_BRANCH_PREFIX}/') }}}}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run API Analyzer compatibility check
+        id: api-analyzer
+        uses: {analyzer_action_ref}
+        with:
+          api-base-url: {cls._yaml_string(analyzer_base_url)}
+          project-id: {project_id_value}
+          token: {token_value}
+          spec-path: {cls._yaml_string(spec_path)}
+{generation_input}
+{action_inputs}
+          baseline-mode: merge-base
+          fail-on-error: "true"
+          poll-timeout-seconds: "600"
+          poll-interval-seconds: "5"
+
+      - name: Publish API Analyzer summary
+        if: always()
+        shell: bash
+        env:
+          GATE_STATUS: ${{{{ steps.api-analyzer.outputs.gate-status }}}}
+          REASON_CODE: ${{{{ steps.api-analyzer.outputs.reason-code }}}}
+          COMPARISON_ID: ${{{{ steps.api-analyzer.outputs.comparison-id }}}}
+          REPORT_URL: ${{{{ steps.api-analyzer.outputs.report-url }}}}
+        run: |
+          echo "API Analyzer gate: $GATE_STATUS"
+          echo "Reason: $REASON_CODE"
+          echo "Comparison: $COMPARISON_ID"
+
+          if [[ -n "$REPORT_URL" ]]; then
+            echo "Report: $REPORT_URL"
+          fi
+"""
+
+    @classmethod
+    def _build_pull_request_body(
+        cls,
+        *,
+        repository_name: str,
+        framework_name: str,
+        adapter_type: str,
+        spec_path: str,
+        generation_command: str,
+        analyzer_action_ref: str,
+        token_secret_name: str,
+        contract_source: str = "generated",
+    ) -> str:
+        normalized_source = str(contract_source).strip() or "generated"
+        source_description = (
+            "the committed contract file"
+            if normalized_source == "committed_file"
+            else "the framework adapter generation command"
+        )
+
+        return (
+            "## API Analyzer automatic setup\n"
+            "\n"
+            "This pull request configures API compatibility analysis for:\n"
+            "\n"
+            f"- Repository: `{repository_name}`\n"
+            f"- Framework: `{framework_name}`\n"
+            f"- Adapter: `{adapter_type}`\n"
+            f"- Contract: `{spec_path}`\n"
+            "\n"
+            "### What will be added\n"
+            "\n"
+            "- `.api-analyzer.yml`\n"
+            f"- `{cls.DEFAULT_WORKFLOW_PATH}`\n"
+            "\n"
+            "### Contract source\n"
+            "\n"
+            f"The compatibility workflow reads {source_description}.\n"
+            "\n"
+            "### Contract generation\n"
+            "\n"
+            "```text\n"
+            f"{generation_command}\n"
+            "```\n"
+            "\n"
+            "### Runtime\n"
+            "\n"
+            "The generated workflow receives the adapter runtime and contract "
+            "acquisition plan automatically. No repository-specific CI logic "
+            "is required.\n"
+            "\n"
+            "### Platform integration\n"
+            "\n"
+            f"- API Analyzer action: `{analyzer_action_ref}`\n"
+            f"- Actions secret: `{token_secret_name}`\n"
+            "- Project identifier: the configured API_ANALYZER_PROJECT_ID "
+            "repository variable when it is not embedded by the platform.\n"
+            "\n"
+            "The setup is intentionally reviewable. API Analyzer does not "
+            "modify repository source code outside this setup pull request.\n"
+            "\n"
+            "The setup pull request is excluded from compatibility analysis. "
+            "The first compatibility check runs on the next normal application "
+            "pull request after setup is merged.\n"
+            "\n"
+            "No repository-specific framework logic is embedded in the "
+            "analyzer core.\n"
+        )
+
+    @staticmethod
+    def _setup_branch_name(*, adapter_type: str) -> str:
+        normalized_adapter = (
+            str(adapter_type)
+            .strip()
+            .lower()
+            .replace("_", "-")
+            .replace(" ", "-")
+        )
+
+        if not normalized_adapter:
+            normalized_adapter = "repository"
+
+        return f"{RepositorySetupService.SETUP_BRANCH_PREFIX}/{normalized_adapter}"
+
+    @staticmethod
+    def _collect_warnings(
+        *,
+        repository: Mapping[str, Any],
+        spec_path: str,
+        project_id: str | None,
+        analyzer_base_url: str,
+        analyzer_action_ref: str,
+    ) -> list[str]:
+        warnings: list[str] = []
+
+        scan_warnings = repository.get("warnings")
+        if isinstance(scan_warnings, (list, tuple)):
+            warnings.extend(
+                str(item)
+                for item in scan_warnings
+                if str(item).strip()
+            )
+
+        if not project_id:
+            warnings.append(
+                "Project ID was not supplied to the setup planner; "
+                "the generated workflow expects the "
+                "API_ANALYZER_PROJECT_ID repository variable."
+            )
+
+        if not analyzer_base_url:
+            warnings.append("No API Analyzer backend URL was resolved.")
+
+        if not analyzer_action_ref:
+            warnings.append("No API Analyzer action reference was resolved.")
+
+        if not spec_path:
+            warnings.append("No contract path was detected; openapi.json will be used.")
+
+        return warnings
