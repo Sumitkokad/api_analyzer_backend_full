@@ -127,6 +127,23 @@ class RepositorySetupService:
         )
         generation_command = generation_plan["command"]
 
+        # For generated contracts, the adapter is authoritative about the
+        # repository-relative output path. The workflow must pass the same
+        # path to the centralized action; otherwise a nested Django project
+        # such as ``backend/manage.py`` would generate ``backend/openapi.json``
+        # while the action still searched for ``openapi.json``.
+        if generation_plan.get("source") == "generated":
+            generated_output_path = self._normalize_path(
+                str(generation_plan.get("output_path") or "").strip()
+            )
+            if not generated_output_path:
+                raise ValueError(
+                    "Adapter contract generation plan must provide a "
+                    "repository-relative output_path."
+                )
+            resolved_spec_path = generated_output_path
+            generation_plan["path"] = generated_output_path
+
         resolved_project_id = self._resolve_project_id(
             repository=repository,
             project_id=project_id,
@@ -196,6 +213,18 @@ class RepositorySetupService:
             analyzer_base_url=resolved_analyzer_base_url,
             analyzer_action_ref=resolved_action_ref,
         )
+
+        # Adapter warnings are part of the reviewable setup plan so the setup
+        # PR exposes any runtime/configuration caveats before merge.
+        generation_warnings = generation_plan.get("warnings") or []
+        if isinstance(generation_warnings, (list, tuple, set)):
+            warnings.extend(
+                str(item).strip()
+                for item in generation_warnings
+                if str(item).strip()
+            )
+        elif str(generation_warnings).strip():
+            warnings.append(str(generation_warnings).strip())
 
         metadata = {
             "setup_mode": "automatic",
@@ -318,6 +347,9 @@ class RepositorySetupService:
         repositories whose API contract is already committed.
 
         Otherwise the resolved framework adapter provides the generation plan.
+        For generated contracts, the adapter's repository-relative ``output_path``
+        is authoritative because it is coupled to the adapter's generation
+        command and working directory.
         """
 
         if repository_spec_path and spec_path == repository_spec_path:
@@ -352,9 +384,18 @@ class RepositorySetupService:
                 "Adapter contract generation plan did not provide a command."
             )
 
+        output_path = getattr(plan, "output_path", None)
+        normalized_output_path = ""
+        if output_path:
+            normalized_output_path = RepositorySetupService._normalize_path(
+                str(output_path)
+            )
+
         result: dict[str, Any] = {
             "command": str(command).strip(),
             "source": "generated",
+            "path": normalized_output_path or spec_path,
+            "output_path": normalized_output_path or spec_path,
             "adapter_name": str(
                 getattr(plan, "adapter_name", None)
                 or getattr(adapter, "adapter_type", None)
@@ -539,6 +580,7 @@ class RepositorySetupService:
             "package_manager",
             "working_directory",
             "install_command",
+            "output_path",
         ):
             value = generation_plan.get(key)
             if value not in (None, ""):
