@@ -29,14 +29,31 @@ from .models import (
 
 
 def _frontend_result_url(success: bool, **params: object) -> str:
+    """Build the canonical React hash-route URL used after GitHub OAuth.
+
+    The GitHub OAuth callback must land directly on the SPA route. We keep
+    the callback result and project id inside the hash so Netlify serves the
+    same SPA entrypoint and React owns the final navigation state.
+    """
+
     base = getattr(
         settings,
         "GITHUB_APP_FRONTEND_URL",
         "http://localhost:5173",
     ).rstrip("/")
-    query = {"github": "connected" if success else "error"}
-    query.update({key: str(value) for key, value in params.items()})
-    return f"{base}/?{urlencode(query)}"
+
+    query = {
+        "github": "connected" if success else "error",
+    }
+    query.update(
+        {
+            key: str(value)
+            for key, value in params.items()
+            if value is not None and str(value) != ""
+        }
+    )
+
+    return f"{base}/#/github?{urlencode(query)}"
 
 
 def _project_for_user(request, project_id):
@@ -94,6 +111,98 @@ class GitHubInstallStartView(APIView):
             return Response(
                 {"detail": "GitHub App is not configured on the server."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        # The current project may already contain a valid installation record
+        # even if the client is operating from a stale browser state. Return
+        # that state instead of creating a second installation flow.
+        current_connection = getattr(project, "github_connection", None)
+        if current_connection is not None and str(
+            current_connection.installation_id or ""
+        ).strip():
+            return Response(
+                {
+                    "already_connected": True,
+                    "reused_existing_installation": False,
+                    "project_id": project.id,
+                    "installation_id": str(
+                        current_connection.installation_id
+                    ),
+                    "repository_full_name": (
+                        current_connection.repository_full_name or ""
+                    ),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        # Reuse an existing installation owned by this same Analyzer user
+        # when one is already recorded. This avoids sending an already
+        # authorized user back through GitHub just because they created a
+        # second Analyzer project. The repository is intentionally cleared
+        # so the user still chooses which repository belongs to this project.
+        existing_connections = (
+            GitHubConnection.objects
+            .filter(project__owner=request.user)
+            .exclude(project_id=project.id)
+            .order_by("-updated_at")[:50]
+        )
+
+        reusable = []
+        for candidate in existing_connections:
+            installation_id = str(candidate.installation_id or "").strip()
+            if not installation_id:
+                continue
+
+            metadata = candidate.metadata or {}
+            app_slug = str(metadata.get("app_slug") or "").strip()
+
+            if app_slug and app_slug != client.app_slug:
+                continue
+
+            reusable.append(candidate)
+
+        installation_ids = {
+            str(candidate.installation_id).strip()
+            for candidate in reusable
+            if str(candidate.installation_id or "").strip()
+        }
+
+        if len(installation_ids) == 1 and reusable:
+            source = reusable[0]
+            connection, _ = GitHubConnection.objects.update_or_create(
+                project=project,
+                defaults={
+                    "installation_id": str(source.installation_id),
+                    "repository_full_name": "",
+                    "connected": False,
+                    "metadata": dict(source.metadata or {}),
+                },
+            )
+
+            AuditLog.objects.create(
+                project=project,
+                actor=request.user,
+                action="github_installation_reused",
+                resource_type="GitHubConnection",
+                resource_id=str(connection.pk),
+                metadata={
+                    "installation_id": str(source.installation_id),
+                    "source_project_id": source.project_id,
+                    "account_login": (source.metadata or {}).get(
+                        "account_login",
+                        "",
+                    ),
+                },
+            )
+
+            return Response(
+                {
+                    "already_connected": True,
+                    "reused_existing_installation": True,
+                    "project_id": project.id,
+                    "installation_id": str(source.installation_id),
+                },
+                status=status.HTTP_200_OK,
             )
 
         now = timezone.now()
