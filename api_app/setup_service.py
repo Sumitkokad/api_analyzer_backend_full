@@ -576,6 +576,11 @@ permissions:
 
 jobs:
   api-compatibility:
+    # The setup PR introduces the contract-generation dependencies/configuration
+    # that the compatibility check itself needs. Do not compare that PR before
+    # those changes are merged; the first real compatibility check starts on the
+    # next application PR.
+    if: ${{ !startsWith(github.head_ref, 'api-analyzer/setup/') }}
     runs-on: ubuntu-latest
 
     steps:
