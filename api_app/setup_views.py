@@ -421,7 +421,8 @@ class GitHubRepositorySetupView(APIView):
                         "adapter": None,
                         "reason": resolution.reason,
                         "errors": list(
-                            resolution.errors
+                            getattr(resolution, "errors", ())
+                            or ()
                         ),
                     },
                     status=status.HTTP_422_UNPROCESSABLE_ENTITY,
