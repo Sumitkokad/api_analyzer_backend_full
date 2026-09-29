@@ -71,13 +71,28 @@ class ContractGenerationPlan:
 
     adapter_type: str
 
+    # Runtime metadata consumed by the centralized CI action.
+    # These fields keep framework-specific runtime decisions inside adapters
+    # instead of leaking them into setup_service.py or action.yml.
+    language: str = ""
+
+    package_manager: str = ""
+
+    dependency_files: tuple[str, ...] = field(default_factory=tuple)
+
     command: str = ""
 
     output_path: str = "openapi.json"
 
     working_directory: str = ""
 
+    install_command: str = ""
+
     environment: Mapping[str, str] = field(default_factory=dict)
+
+    adapter_name: str = ""
+
+    adapter_version: str = "1"
 
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
