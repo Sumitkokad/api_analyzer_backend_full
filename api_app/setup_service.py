@@ -4,16 +4,10 @@ Automatic repository setup planning.
 This module converts repository scan results into a reviewable setup plan.
 It does not call GitHub and does not modify repositories.
 
-The resulting plan can later be consumed by a GitHub write service that
-creates a setup branch and pull request.
-
-The design is framework-agnostic. Framework-specific behavior comes from
-the detected adapter and its contract-generation plan.
-
-The generated workflow delegates compatibility execution to the
-API Analyzer composite action. Repository-specific framework knowledge
-stays inside the adapter; this service only wires the detected plan into
-a reviewable GitHub Actions workflow.
+The GitHub write layer can consume the resulting plan to create one setup
+branch and one setup pull request. Framework-specific contract generation
+remains inside the resolved adapter. This service only validates and wires
+that adapter plan into repository configuration.
 """
 
 from __future__ import annotations
@@ -21,15 +15,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import os
+import re
+from textwrap import indent
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
 class SetupFile:
-    """
-    A file that should be created or updated by the setup PR.
-    """
+    """A file that should be created or updated by the setup PR."""
 
     path: str
     content: str
@@ -37,9 +31,7 @@ class SetupFile:
 
 @dataclass(frozen=True)
 class SetupPlan:
-    """
-    Complete reviewable setup plan for a repository.
-    """
+    """Complete reviewable setup plan for a repository."""
 
     repository: str
     base_branch: str
@@ -53,7 +45,6 @@ class SetupPlan:
     adapter_type: str
     framework_name: str
     spec_path: str
-
     generation_command: str
 
     warnings: tuple[str, ...] = field(default_factory=tuple)
@@ -69,11 +60,8 @@ class RepositorySetupService:
     """
     Build automatic API Analyzer onboarding plans.
 
-    This service does not assume a particular repository such as CodeForge.
-    It operates entirely from detected repository metadata.
-
-    The API Analyzer action reference and backend URL are configurable so
-    the same setup logic can be used across environments.
+    Framework detection and generation are delegated to the adapter layer.
+    The setup service does not contain per-framework command branches.
     """
 
     DEFAULT_WORKFLOW_PATH = ".github/workflows/api-compatibility.yml"
@@ -91,6 +79,11 @@ class RepositorySetupService:
     DEFAULT_TOKEN_SECRET_NAME = "API_ANALYZER_TOKEN"
     DEFAULT_PROJECT_VARIABLE_NAME = "API_ANALYZER_PROJECT_ID"
 
+    _SECRET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    _ACTION_REF_PATTERN = re.compile(
+        r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[^@\s]+)?@[A-Za-z0-9_.-]+$"
+    )
+
     def build_plan(
         self,
         *,
@@ -103,54 +96,14 @@ class RepositorySetupService:
         analyzer_action_ref: str | None = None,
         token_secret_name: str | None = None,
     ) -> SetupPlan:
-        """
-        Build a setup PR plan for the detected repository.
-
-        Parameters
-        ----------
-        repository:
-            Repository metadata returned by the GitHub scanner.
-
-        adapter:
-            Resolved contract adapter instance.
-
-        base_branch:
-            Repository default branch.
-
-        spec_path:
-            Optional explicitly configured contract path.
-
-        project_id:
-            Optional API Analyzer project identifier. When omitted, the
-            generated workflow reads it from the repository variable
-            API_ANALYZER_PROJECT_ID.
-
-        analyzer_base_url:
-            Optional API Analyzer backend URL. When omitted, repository
-            metadata or the configured service default is used.
-
-        analyzer_action_ref:
-            Optional GitHub Action reference. When omitted, repository
-            metadata or the configured service default is used.
-
-        token_secret_name:
-            Repository Actions secret that contains the project-scoped
-            API Analyzer token.
-        """
+        """Build a setup PR plan for the detected repository."""
 
         repository_name = self._repository_name(repository)
-
         branch = self._normalize_branch(
-            base_branch
-            or repository.get("default_branch")
-            or "main"
+            base_branch or repository.get("default_branch") or "main"
         )
 
-        adapter_type = self._adapter_value(
-            adapter,
-            "adapter_type",
-        )
-
+        adapter_type = self._adapter_value(adapter, "adapter_type")
         framework_name = self._adapter_value(
             adapter,
             "framework_name",
@@ -161,43 +114,31 @@ class RepositorySetupService:
             self._normalize_path(spec_path)
             if spec_path
             else self._repository_spec_path(repository)
-        )
+        ) or "openapi.json"
 
-        if not resolved_spec_path:
-            resolved_spec_path = "openapi.json"
-
-        commit_sha = str(
-            repository.get("commit_sha")
-            or ""
-        ).strip()
-
-        generation_command = self._generation_command(
+        commit_sha = str(repository.get("commit_sha") or "").strip()
+        generation_plan = self._contract_generation_plan(
             adapter=adapter,
             repository=repository,
             commit_sha=commit_sha,
         )
+        generation_command = generation_plan["command"]
 
         resolved_project_id = self._resolve_project_id(
             repository=repository,
             project_id=project_id,
         )
-
         resolved_analyzer_base_url = self._resolve_analyzer_base_url(
             repository=repository,
             analyzer_base_url=analyzer_base_url,
         )
-
         resolved_action_ref = self._resolve_action_ref(
             repository=repository,
             analyzer_action_ref=analyzer_action_ref,
         )
-
-        resolved_token_secret = (
-            str(
-                token_secret_name
-                or repository.get("token_secret_name")
-                or self.DEFAULT_TOKEN_SECRET_NAME
-            ).strip()
+        resolved_token_secret = self._resolve_token_secret_name(
+            repository=repository,
+            token_secret_name=token_secret_name,
         )
 
         self._validate_analyzer_action_ref(resolved_action_ref)
@@ -221,23 +162,15 @@ class RepositorySetupService:
             project_id=resolved_project_id,
             analyzer_action_ref=resolved_action_ref,
             token_secret_name=resolved_token_secret,
+            generation_plan=generation_plan,
         )
 
         files = (
-            SetupFile(
-                path=self.DEFAULT_CONFIG_PATH,
-                content=config_content,
-            ),
-            SetupFile(
-                path=self.DEFAULT_WORKFLOW_PATH,
-                content=workflow_content,
-            ),
+            SetupFile(path=self.DEFAULT_CONFIG_PATH, content=config_content),
+            SetupFile(path=self.DEFAULT_WORKFLOW_PATH, content=workflow_content),
         )
 
-        branch_name = self._setup_branch_name(
-            adapter_type=adapter_type,
-        )
-
+        branch_name = self._setup_branch_name(adapter_type=adapter_type)
         pull_request_title = "chore: configure API compatibility analysis"
 
         pull_request_body = self._build_pull_request_body(
@@ -252,7 +185,6 @@ class RepositorySetupService:
 
         warnings = self._collect_warnings(
             repository=repository,
-            adapter=adapter,
             spec_path=resolved_spec_path,
             project_id=resolved_project_id,
             analyzer_base_url=resolved_analyzer_base_url,
@@ -270,6 +202,8 @@ class RepositorySetupService:
             "analyzer_action_ref": resolved_action_ref,
             "token_secret_name": resolved_token_secret,
             "project_variable_name": self.DEFAULT_PROJECT_VARIABLE_NAME,
+            "contract_generation": generation_plan,
+            "setup_branch_prefix": self.SETUP_BRANCH_PREFIX,
         }
 
         return SetupPlan(
@@ -292,9 +226,7 @@ class RepositorySetupService:
         )
 
     @staticmethod
-    def _repository_name(
-        repository: Mapping[str, Any],
-    ) -> str:
+    def _repository_name(repository: Mapping[str, Any]) -> str:
         for key in (
             "repository_full_name",
             "full_name",
@@ -302,13 +234,10 @@ class RepositorySetupService:
             "name",
         ):
             value = repository.get(key)
-
             if value:
                 return str(value).strip()
 
-        raise ValueError(
-            "Repository name is required to build a setup plan."
-        )
+        raise ValueError("Repository name is required to build a setup plan.")
 
     @staticmethod
     def _adapter_value(
@@ -318,13 +247,10 @@ class RepositorySetupService:
         default: str | None = None,
     ) -> str:
         value = getattr(adapter, attribute, None)
-
         if value:
             return str(value).strip()
-
         if default is not None:
             return default
-
         raise ValueError(
             f"Adapter does not provide required attribute '{attribute}'."
         )
@@ -332,19 +258,15 @@ class RepositorySetupService:
     @staticmethod
     def _normalize_branch(branch: str) -> str:
         normalized = str(branch).strip()
-
         if not normalized:
             return "main"
-
+        if any(char in normalized for char in "\r\n"):
+            raise ValueError("Repository branch cannot contain newlines.")
         return normalized
 
     @staticmethod
     def _normalize_path(path: str) -> str:
-        normalized = (
-            str(path)
-            .strip()
-            .replace("\\", "/")
-        )
+        normalized = str(path).strip().replace("\\", "/")
 
         while normalized.startswith("./"):
             normalized = normalized[2:]
@@ -355,11 +277,11 @@ class RepositorySetupService:
             raise ValueError("Contract path cannot be empty.")
 
         parts = normalized.split("/")
-
         if ".." in parts:
-            raise ValueError(
-                "Contract path cannot escape the repository root."
-            )
+            raise ValueError("Contract path cannot escape the repository root.")
+
+        if any(char in normalized for char in "\r\n"):
+            raise ValueError("Contract path cannot contain newlines.")
 
         return normalized
 
@@ -368,24 +290,23 @@ class RepositorySetupService:
         repository: Mapping[str, Any],
     ) -> str | None:
         value = repository.get("spec_path")
-
         if not value:
             return None
-
         return self._normalize_path(str(value))
 
     @staticmethod
-    def _generation_command(
+    def _contract_generation_plan(
         *,
         adapter: Any,
         repository: Mapping[str, Any],
         commit_sha: str,
-    ) -> str:
+    ) -> dict[str, Any]:
         """
-        Ask the adapter for its generation plan.
+        Ask the adapter for its contract generation plan exactly once.
 
-        The adapter remains the only component that knows the framework-
-        specific generation command.
+        New adapters may expose runtime metadata such as language,
+        package manager, dependency files, working directory, or install
+        command. Older adapters only need to expose ``command``.
         """
 
         try:
@@ -400,14 +321,37 @@ class RepositorySetupService:
             ) from exc
 
         command = getattr(plan, "command", None)
-
         if not command:
             raise ValueError(
-                "Adapter contract generation plan did not provide "
-                "a command."
+                "Adapter contract generation plan did not provide a command."
             )
 
-        return str(command).strip()
+        result: dict[str, Any] = {"command": str(command).strip()}
+
+        for attribute in (
+            "language",
+            "package_manager",
+            "dependency_files",
+            "working_directory",
+            "install_command",
+            "environment",
+        ):
+            value = getattr(plan, attribute, None)
+            if value is not None:
+                if attribute == "dependency_files" and isinstance(
+                    value, (list, tuple, set)
+                ):
+                    value = [str(item) for item in value]
+                elif attribute == "environment" and isinstance(value, Mapping):
+                    value = {
+                        str(key): str(item)
+                        for key, item in value.items()
+                    }
+                else:
+                    value = str(value).strip()
+                result[attribute] = value
+
+        return result
 
     def _resolve_project_id(
         self,
@@ -415,15 +359,9 @@ class RepositorySetupService:
         repository: Mapping[str, Any],
         project_id: str | int | None,
     ) -> str | None:
-        value = (
-            project_id
-            if project_id is not None
-            else repository.get("project_id")
-        )
-
+        value = project_id if project_id is not None else repository.get("project_id")
         if value is None or str(value).strip() == "":
             return None
-
         return str(value).strip()
 
     def _resolve_analyzer_base_url(
@@ -438,7 +376,6 @@ class RepositorySetupService:
             or repository.get("api_analyzer_base_url")
             or self.DEFAULT_ANALYZER_BASE_URL
         )
-
         return self._normalize_base_url(str(value))
 
     def _resolve_action_ref(
@@ -452,42 +389,63 @@ class RepositorySetupService:
             or repository.get("analyzer_action_ref")
             or self.DEFAULT_ANALYZER_ACTION_REF
         )
-
         normalized = str(value).strip()
-
         if not normalized:
             raise ValueError("API Analyzer action reference cannot be empty.")
+        if any(char in normalized for char in "\r\n"):
+            raise ValueError("API Analyzer action reference cannot contain newlines.")
+        return normalized
 
+    def _resolve_token_secret_name(
+        self,
+        *,
+        repository: Mapping[str, Any],
+        token_secret_name: str | None,
+    ) -> str:
+        value = (
+            token_secret_name
+            or repository.get("token_secret_name")
+            or self.DEFAULT_TOKEN_SECRET_NAME
+        )
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError("API Analyzer token secret name cannot be empty.")
+        if not self._SECRET_NAME_PATTERN.fullmatch(normalized):
+            raise ValueError(
+                "API Analyzer token secret name must contain only letters, "
+                "digits, and underscores and must not start with a digit."
+            )
         return normalized
 
     @staticmethod
     def _normalize_base_url(value: str) -> str:
         normalized = value.strip().rstrip("/")
-
         if not normalized:
-            raise ValueError(
-                "API Analyzer base URL cannot be empty."
-            )
+            raise ValueError("API Analyzer base URL cannot be empty.")
 
         parsed = urlparse(normalized)
-
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError(
                 "API Analyzer base URL must be an absolute HTTP(S) URL."
             )
-
         return normalized
 
-    @staticmethod
-    def _validate_analyzer_action_ref(action_ref: str) -> None:
-        if "/" not in action_ref or "@" not in action_ref:
+    @classmethod
+    def _validate_analyzer_action_ref(cls, action_ref: str) -> None:
+        if not cls._ACTION_REF_PATTERN.fullmatch(action_ref):
             raise ValueError(
                 "API Analyzer action reference must look like "
                 "'owner/repository/path@ref'."
             )
 
     @staticmethod
+    def _yaml_string(value: str) -> str:
+        """Return a YAML-safe JSON string literal."""
+        return json.dumps(str(value), ensure_ascii=False)
+
+    @classmethod
     def _build_config(
+        cls,
         *,
         adapter_type: str,
         framework_name: str,
@@ -496,28 +454,59 @@ class RepositorySetupService:
         project_id: str | None,
         analyzer_action_ref: str,
         token_secret_name: str,
+        generation_plan: Mapping[str, Any],
     ) -> str:
         project_value = (
-            project_id
+            str(project_id)
             if project_id is not None
             else "repository variable: API_ANALYZER_PROJECT_ID"
         )
 
-        return (
-            "# API Analyzer configuration\n"
-            "# Generated automatically by API Analyzer.\n"
-            "# Review this file in the setup pull request before merging.\n"
-            "\n"
-            "api_analyzer:\n"
-            f'  adapter: "{adapter_type}"\n'
-            f'  framework: "{framework_name}"\n'
-            f'  spec_path: "{spec_path}"\n'
-            '  baseline_mode: "merge-base"\n'
-            f'  analyzer_base_url: "{analyzer_base_url}"\n'
-            f'  analyzer_action: "{analyzer_action_ref}"\n'
-            f'  project_id: "{project_value}"\n'
-            f'  token_secret: "{token_secret_name}"\n'
-        )
+        lines = [
+            "# API Analyzer configuration",
+            "# Generated automatically by API Analyzer.",
+            "# Review this file in the setup pull request before merging.",
+            "",
+            "api_analyzer:",
+            f"  adapter: {cls._yaml_string(adapter_type)}",
+            f"  framework: {cls._yaml_string(framework_name)}",
+            f"  spec_path: {cls._yaml_string(spec_path)}",
+            '  baseline_mode: "merge-base"',
+            f"  analyzer_base_url: {cls._yaml_string(analyzer_base_url)}",
+            f"  analyzer_action: {cls._yaml_string(analyzer_action_ref)}",
+            f"  project_id: {cls._yaml_string(project_value)}",
+            f"  token_secret: {cls._yaml_string(token_secret_name)}",
+            "",
+            "  contract_generation:",
+            f"    command: {cls._yaml_string(str(generation_plan['command']))}",
+        ]
+
+        for key in (
+            "language",
+            "package_manager",
+            "working_directory",
+            "install_command",
+        ):
+            value = generation_plan.get(key)
+            if value not in (None, ""):
+                lines.append(f"    {key}: {cls._yaml_string(str(value))}")
+
+        dependency_files = generation_plan.get("dependency_files")
+        if dependency_files:
+            lines.append("    dependency_files:")
+            for item in dependency_files:
+                lines.append(f"      - {cls._yaml_string(str(item))}")
+
+        environment = generation_plan.get("environment")
+        if environment:
+            lines.append("    environment:")
+            for key, value in environment.items():
+                lines.append(
+                    f"      {cls._yaml_string(str(key))}: "
+                    f"{cls._yaml_string(str(value))}"
+                )
+
+        return "\n".join(lines) + "\n"
 
     @classmethod
     def _build_workflow(
@@ -533,25 +522,26 @@ class RepositorySetupService:
         token_secret_name: str,
     ) -> str:
         """
-        Build the real repository-side compatibility workflow.
+        Build the repository-side compatibility workflow.
 
-        The generated workflow delegates comparison execution to the
-        platform-maintained composite action. The action is responsible
-        for creating the exact base/head snapshots, submitting the
-        analysis, preserving queue behavior, polling, and enforcing the
-        final gate.
-
-        The repository setup service only supplies detected configuration.
+        The workflow deliberately skips the one-time setup PR. That prevents
+        the newly generated contract command from being executed against the
+        pre-setup merge-base, where its dependencies/configuration may not yet
+        exist.
         """
 
+        if not generation_command.strip():
+            raise ValueError("Contract generation command cannot be empty.")
+
         project_id_value = (
-            json.dumps(str(project_id))
+            cls._yaml_string(str(project_id))
             if project_id is not None
             else "${{ vars.API_ANALYZER_PROJECT_ID }}"
         )
-
-        token_value = (
-            "${{ secrets." + token_secret_name + " }}"
+        token_value = "${{ secrets." + token_secret_name + " }}"
+        generation_block = indent(
+            generation_command.rstrip(),
+            "            ",
         )
 
         return f"""# API Analyzer compatibility workflow
@@ -576,11 +566,9 @@ permissions:
 
 jobs:
   api-compatibility:
-    # The setup PR introduces the contract-generation dependencies/configuration
-    # that the compatibility check itself needs. Do not compare that PR before
-    # those changes are merged; the first real compatibility check starts on the
-    # next application PR.
-    if: ${{ !startsWith(github.head_ref, 'api-analyzer/setup/') }}
+    # The setup PR introduces the generator dependencies/configuration. Do not
+    # run compatibility analysis until that setup PR has been merged.
+    if: ${{{{ !startsWith(github.head_ref, '{RepositorySetupService.SETUP_BRANCH_PREFIX}/') }}}}
     runs-on: ubuntu-latest
 
     steps:
@@ -593,12 +581,12 @@ jobs:
         id: api-analyzer
         uses: {analyzer_action_ref}
         with:
-          api-base-url: {json.dumps(analyzer_base_url)}
+          api-base-url: {cls._yaml_string(analyzer_base_url)}
           project-id: {project_id_value}
           token: {token_value}
-          spec-path: {json.dumps(spec_path)}
+          spec-path: {cls._yaml_string(spec_path)}
           generate-command: |
-            {generation_command}
+{generation_block}
           baseline-mode: merge-base
           fail-on-error: "true"
           poll-timeout-seconds: "600"
@@ -662,22 +650,19 @@ jobs:
             "- Project identifier: the configured API_ANALYZER_PROJECT_ID "
             "repository variable when it is not embedded by the platform.\n"
             "\n"
-            "The setup is intentionally reviewable. "
-            "API Analyzer does not modify repository source code outside "
-            "this setup pull request.\n"
+            "The setup is intentionally reviewable. API Analyzer does not "
+            "modify repository source code outside this setup pull request.\n"
             "\n"
-            "After this pull request is merged, future pull requests will "
-            "run the compatibility workflow automatically.\n"
+            "The setup pull request is excluded from compatibility analysis. "
+            "The first compatibility check runs on the next normal application "
+            "pull request after setup is merged.\n"
             "\n"
             "No repository-specific framework logic is embedded in the "
             "analyzer core.\n"
         )
 
     @staticmethod
-    def _setup_branch_name(
-        *,
-        adapter_type: str,
-    ) -> str:
+    def _setup_branch_name(*, adapter_type: str) -> str:
         normalized_adapter = (
             str(adapter_type)
             .strip()
@@ -689,16 +674,12 @@ jobs:
         if not normalized_adapter:
             normalized_adapter = "repository"
 
-        return (
-            f"{RepositorySetupService.SETUP_BRANCH_PREFIX}/"
-            f"{normalized_adapter}"
-        )
+        return f"{RepositorySetupService.SETUP_BRANCH_PREFIX}/{normalized_adapter}"
 
     @staticmethod
     def _collect_warnings(
         *,
         repository: Mapping[str, Any],
-        adapter: Any,
         spec_path: str,
         project_id: str | None,
         analyzer_base_url: str,
@@ -707,7 +688,6 @@ jobs:
         warnings: list[str] = []
 
         scan_warnings = repository.get("warnings")
-
         if isinstance(scan_warnings, (list, tuple)):
             warnings.extend(
                 str(item)
@@ -723,18 +703,12 @@ jobs:
             )
 
         if not analyzer_base_url:
-            warnings.append(
-                "No API Analyzer backend URL was resolved."
-            )
+            warnings.append("No API Analyzer backend URL was resolved.")
 
         if not analyzer_action_ref:
-            warnings.append(
-                "No API Analyzer action reference was resolved."
-            )
+            warnings.append("No API Analyzer action reference was resolved.")
 
         if not spec_path:
-            warnings.append(
-                "No contract path was detected; openapi.json will be used."
-            )
+            warnings.append("No contract path was detected; openapi.json will be used.")
 
         return warnings
