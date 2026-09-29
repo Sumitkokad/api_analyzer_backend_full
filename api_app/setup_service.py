@@ -110,10 +110,11 @@ class RepositorySetupService:
             default=adapter_type,
         )
 
+        repository_spec_path = self._repository_spec_path(repository)
         resolved_spec_path = (
             self._normalize_path(spec_path)
             if spec_path
-            else self._repository_spec_path(repository)
+            else repository_spec_path
         ) or "openapi.json"
 
         commit_sha = str(repository.get("commit_sha") or "").strip()
@@ -121,6 +122,8 @@ class RepositorySetupService:
             adapter=adapter,
             repository=repository,
             commit_sha=commit_sha,
+            spec_path=resolved_spec_path,
+            repository_spec_path=repository_spec_path,
         )
         generation_command = generation_plan["command"]
 
@@ -152,6 +155,7 @@ class RepositorySetupService:
             analyzer_base_url=resolved_analyzer_base_url,
             project_id=resolved_project_id,
             token_secret_name=resolved_token_secret,
+            contract_source=str(generation_plan.get("source") or "generated"),
         )
 
         config_content = self._build_config(
@@ -181,6 +185,7 @@ class RepositorySetupService:
             generation_command=generation_command,
             analyzer_action_ref=resolved_action_ref,
             token_secret_name=resolved_token_secret,
+            contract_source=str(generation_plan.get("source") or "generated"),
         )
 
         warnings = self._collect_warnings(
@@ -203,6 +208,7 @@ class RepositorySetupService:
             "token_secret_name": resolved_token_secret,
             "project_variable_name": self.DEFAULT_PROJECT_VARIABLE_NAME,
             "contract_generation": generation_plan,
+            "contract_source": str(generation_plan.get("source") or "generated"),
             "setup_branch_prefix": self.SETUP_BRANCH_PREFIX,
         }
 
@@ -300,14 +306,25 @@ class RepositorySetupService:
         adapter: Any,
         repository: Mapping[str, Any],
         commit_sha: str,
+        spec_path: str,
+        repository_spec_path: str | None,
     ) -> dict[str, Any]:
-        """
-        Ask the adapter for its contract generation plan exactly once.
+        """Resolve how the compatibility workflow obtains the API contract.
 
-        New adapters may expose runtime metadata such as language,
-        package manager, dependency files, working directory, or install
-        command. Older adapters only need to expose ``command``.
+        If repository scanning found a committed OpenAPI/Swagger contract and
+        the selected ``spec_path`` points to that same file, use the file
+        directly. This avoids incorrectly running a framework generator for
+        repositories whose API contract is already committed.
+
+        Otherwise the resolved framework adapter provides the generation plan.
         """
+
+        if repository_spec_path and spec_path == repository_spec_path:
+            return {
+                "command": "",
+                "source": "committed_file",
+                "path": repository_spec_path,
+            }
 
         try:
             plan = adapter.generate_contract(
@@ -326,7 +343,10 @@ class RepositorySetupService:
                 "Adapter contract generation plan did not provide a command."
             )
 
-        result: dict[str, Any] = {"command": str(command).strip()}
+        result: dict[str, Any] = {
+            "command": str(command).strip(),
+            "source": "generated",
+        }
 
         for attribute in (
             "language",
@@ -462,6 +482,8 @@ class RepositorySetupService:
             else "repository variable: API_ANALYZER_PROJECT_ID"
         )
 
+        source_value = str(generation_plan.get("source") or "generated")
+
         lines = [
             "# API Analyzer configuration",
             "# Generated automatically by API Analyzer.",
@@ -478,6 +500,7 @@ class RepositorySetupService:
             f"  token_secret: {cls._yaml_string(token_secret_name)}",
             "",
             "  contract_generation:",
+            f"    source: {cls._yaml_string(source_value)}",
             f"    command: {cls._yaml_string(str(generation_plan['command']))}",
         ]
 
@@ -520,18 +543,18 @@ class RepositorySetupService:
         analyzer_base_url: str,
         project_id: str | None,
         token_secret_name: str,
+        contract_source: str = "generated",
     ) -> str:
-        """
-        Build the repository-side compatibility workflow.
+        """Build the repository-side compatibility workflow.
 
-        The workflow deliberately skips the one-time setup PR. That prevents
-        the newly generated contract command from being executed against the
-        pre-setup merge-base, where its dependencies/configuration may not yet
-        exist.
+        The one-time setup PR is excluded from compatibility analysis so the
+        generated setup configuration is not executed against its pre-setup
+        merge-base. A committed contract is also supported: the centralized
+        action receives an empty generation command and reads ``spec_path``
+        directly from each base/head worktree.
         """
 
-        if not generation_command.strip():
-            raise ValueError("Contract generation command cannot be empty.")
+        normalized_source = str(contract_source).strip() or "generated"
 
         project_id_value = (
             cls._yaml_string(str(project_id))
@@ -539,10 +562,15 @@ class RepositorySetupService:
             else "${{ vars.API_ANALYZER_PROJECT_ID }}"
         )
         token_value = "${{ secrets." + token_secret_name + " }}"
-        generation_block = indent(
-            generation_command.rstrip(),
-            "            ",
-        )
+        normalized_generation_command = str(generation_command or "").strip()
+
+        if normalized_generation_command:
+            generation_input = (
+                "          generate-command: |\n"
+                f"{indent(normalized_generation_command, '            ')}"
+            )
+        else:
+            generation_input = '          generate-command: ""'
 
         return f"""# API Analyzer compatibility workflow
 # Generated automatically by API Analyzer.
@@ -550,6 +578,7 @@ class RepositorySetupService:
 # Adapter: {adapter_type}
 # Framework: {framework_name}
 # Contract: {spec_path}
+# Contract source: {normalized_source}
 
 name: API Compatibility
 
@@ -585,8 +614,7 @@ jobs:
           project-id: {project_id_value}
           token: {token_value}
           spec-path: {cls._yaml_string(spec_path)}
-          generate-command: |
-{generation_block}
+{generation_input}
           baseline-mode: merge-base
           fail-on-error: "true"
           poll-timeout-seconds: "600"
@@ -621,7 +649,15 @@ jobs:
         generation_command: str,
         analyzer_action_ref: str,
         token_secret_name: str,
+        contract_source: str = "generated",
     ) -> str:
+        normalized_source = str(contract_source).strip() or "generated"
+        source_description = (
+            "the committed contract file"
+            if normalized_source == "committed_file"
+            else "the framework adapter generation command"
+        )
+
         return (
             "## API Analyzer automatic setup\n"
             "\n"
@@ -637,7 +673,11 @@ jobs:
             "- `.api-analyzer.yml`\n"
             f"- `{cls.DEFAULT_WORKFLOW_PATH}`\n"
             "\n"
-            "### Detected contract generation\n"
+            "### Contract source\n"
+            "\n"
+            f"The compatibility workflow reads {source_description}.\n"
+            "\n"
+            "### Contract generation\n"
             "\n"
             "```text\n"
             f"{generation_command}\n"
