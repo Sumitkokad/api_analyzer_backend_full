@@ -156,6 +156,7 @@ class RepositorySetupService:
             project_id=resolved_project_id,
             token_secret_name=resolved_token_secret,
             contract_source=str(generation_plan.get("source") or "generated"),
+            generation_plan=generation_plan,
         )
 
         config_content = self._build_config(
@@ -324,6 +325,14 @@ class RepositorySetupService:
                 "command": "",
                 "source": "committed_file",
                 "path": repository_spec_path,
+                "language": "",
+                "package_manager": "",
+                "dependency_files": [],
+                "working_directory": ".",
+                "install_command": "",
+                "environment": {},
+                "adapter_name": "committed-contract",
+                "adapter_version": "1",
             }
 
         try:
@@ -346,7 +355,28 @@ class RepositorySetupService:
         result: dict[str, Any] = {
             "command": str(command).strip(),
             "source": "generated",
+            "adapter_name": str(
+                getattr(plan, "adapter_name", None)
+                or getattr(adapter, "adapter_type", None)
+                or "customer-adapter"
+            ).strip(),
+            "adapter_version": str(
+                getattr(plan, "adapter_version", None)
+                or getattr(adapter, "version", None)
+                or "1"
+            ).strip(),
         }
+
+        plan_warnings = getattr(plan, "warnings", None)
+        if plan_warnings is not None:
+            if isinstance(plan_warnings, (list, tuple, set)):
+                result["warnings"] = [
+                    str(item).strip()
+                    for item in plan_warnings
+                    if str(item).strip()
+                ]
+            elif str(plan_warnings).strip():
+                result["warnings"] = [str(plan_warnings).strip()]
 
         for attribute in (
             "language",
@@ -529,6 +559,14 @@ class RepositorySetupService:
                     f"{cls._yaml_string(str(value))}"
                 )
 
+        warnings = generation_plan.get("warnings")
+        if warnings:
+            lines.append("    warnings:")
+            for warning in warnings:
+                lines.append(
+                    f"      - {cls._yaml_string(str(warning))}"
+                )
+
         return "\n".join(lines) + "\n"
 
     @classmethod
@@ -544,16 +582,19 @@ class RepositorySetupService:
         project_id: str | None,
         token_secret_name: str,
         contract_source: str = "generated",
+        generation_plan: Mapping[str, Any] | None = None,
     ) -> str:
         """Build the repository-side compatibility workflow.
 
-        The one-time setup PR is excluded from compatibility analysis so the
-        generated setup configuration is not executed against its pre-setup
-        merge-base. A committed contract is also supported: the centralized
-        action receives an empty generation command and reads ``spec_path``
-        directly from each base/head worktree.
-        """
+        The workflow is technology-neutral. The resolved adapter supplies
+        contract-acquisition/runtime metadata, while the centralized action
+        performs the common BASE-vs-HEAD comparison and CI gate.
 
+        A committed contract uses an empty generation command and requires no
+        framework runtime. Generated contracts receive the adapter's runtime,
+        dependency, working-directory, installation, and environment plan.
+        """
+        plan = dict(generation_plan or {})
         normalized_source = str(contract_source).strip() or "generated"
 
         project_id_value = (
@@ -562,15 +603,107 @@ class RepositorySetupService:
             else "${{ vars.API_ANALYZER_PROJECT_ID }}"
         )
         token_value = "${{ secrets." + token_secret_name + " }}"
-        normalized_generation_command = str(generation_command or "").strip()
+        normalized_generation_command = str(
+            generation_command or ""
+        ).strip()
 
-        if normalized_generation_command:
+        if normalized_source == "committed_file":
+            if normalized_generation_command:
+                raise ValueError(
+                    "Committed contract source cannot have a generation command."
+                )
+            generation_input = '          generate-command: ""'
+        elif normalized_generation_command:
             generation_input = (
                 "          generate-command: |\n"
                 f"{indent(normalized_generation_command, '            ')}"
             )
         else:
-            generation_input = '          generate-command: ""'
+            raise ValueError(
+                "Generated contract source requires a non-empty generation command."
+            )
+
+        language = str(plan.get("language") or "").strip()
+        package_manager = str(plan.get("package_manager") or "").strip()
+        working_directory = str(plan.get("working_directory") or "").strip()
+        install_command = str(plan.get("install_command") or "").strip()
+        adapter_name = str(
+            plan.get("adapter_name") or adapter_type
+        ).strip()
+        adapter_version = str(
+            plan.get("adapter_version") or "1"
+        ).strip()
+
+        dependency_files = plan.get("dependency_files") or []
+        if isinstance(dependency_files, str):
+            dependency_files = [
+                line.strip()
+                for line in dependency_files.splitlines()
+                if line.strip()
+            ]
+        else:
+            dependency_files = [
+                str(item).strip()
+                for item in dependency_files
+                if str(item).strip()
+            ]
+
+        environment = plan.get("environment") or {}
+        if not isinstance(environment, Mapping):
+            environment = {}
+
+        environment_lines: list[str] = []
+        for key, value in environment.items():
+            normalized_key = str(key).strip()
+            normalized_value = str(value).replace("\r", "").replace("\n", "\\n")
+            if normalized_key:
+                environment_lines.append(
+                    f"{normalized_key}={normalized_value}"
+                )
+
+        warnings = plan.get("warnings") or []
+        if isinstance(warnings, str):
+            warnings = [
+                line.strip()
+                for line in warnings.splitlines()
+                if line.strip()
+            ]
+        else:
+            warnings = [
+                str(item).strip()
+                for item in warnings
+                if str(item).strip()
+            ]
+
+        input_lines = [
+            "          contract-source: " + cls._yaml_string(normalized_source),
+            "          language: " + cls._yaml_string(language),
+            "          package-manager: " + cls._yaml_string(package_manager),
+            "          working-directory: " + cls._yaml_string(working_directory),
+            "          install-command: " + cls._yaml_string(install_command),
+            "          adapter-name: " + cls._yaml_string(adapter_name),
+            "          adapter-version: " + cls._yaml_string(adapter_version),
+        ]
+
+        if dependency_files:
+            input_lines.append("          dependency-files: |")
+            input_lines.extend(f"            {item}" for item in dependency_files)
+        else:
+            input_lines.append('          dependency-files: ""')
+
+        if environment_lines:
+            input_lines.append("          environment: |")
+            input_lines.extend(f"            {item}" for item in environment_lines)
+        else:
+            input_lines.append('          environment: ""')
+
+        if warnings:
+            input_lines.append("          generator-warnings: |")
+            input_lines.extend(f"            {item}" for item in warnings)
+        else:
+            input_lines.append('          generator-warnings: ""')
+
+        action_inputs = "\n".join(input_lines)
 
         return f"""# API Analyzer compatibility workflow
 # Generated automatically by API Analyzer.
@@ -595,8 +728,8 @@ permissions:
 
 jobs:
   api-compatibility:
-    # The setup PR introduces the generator dependencies/configuration. Do not
-    # run compatibility analysis until that setup PR has been merged.
+    # The one-time setup PR adds the compatibility configuration itself.
+    # It must never be analyzed against its pre-setup merge-base.
     if: ${{{{ !startsWith(github.head_ref, '{RepositorySetupService.SETUP_BRANCH_PREFIX}/') }}}}
     runs-on: ubuntu-latest
 
@@ -615,6 +748,7 @@ jobs:
           token: {token_value}
           spec-path: {cls._yaml_string(spec_path)}
 {generation_input}
+{action_inputs}
           baseline-mode: merge-base
           fail-on-error: "true"
           poll-timeout-seconds: "600"
@@ -682,6 +816,12 @@ jobs:
             "```text\n"
             f"{generation_command}\n"
             "```\n"
+            "\n"
+            "### Runtime\n"
+            "\n"
+            "The generated workflow receives the adapter runtime and contract "
+            "acquisition plan automatically. No repository-specific CI logic "
+            "is required.\n"
             "\n"
             "### Platform integration\n"
             "\n"
