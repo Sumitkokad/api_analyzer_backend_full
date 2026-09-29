@@ -31,6 +31,7 @@ restriction. This adapter must work with any repository that provides
 sufficient Django REST Framework evidence.
 """
 
+import posixpath
 import re
 from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
@@ -52,9 +53,13 @@ from .base import (
 
 ADAPTER_TYPE = "django-rest-framework"
 
+ADAPTER_VERSION = "1.0.0"
+
 FRAMEWORK_NAME = "Django REST Framework"
 
 LANGUAGE = "Python"
+
+PACKAGE_MANAGER = "pip"
 
 DEFAULT_OUTPUT_PATH = "openapi.json"
 
@@ -393,6 +398,110 @@ def _find_manage_py(
     return candidates[0] if candidates else ""
 
 
+def _dependency_files_for_repository(
+    repository: Mapping[str, Any],
+    *,
+    working_directory: str,
+) -> tuple[str, ...]:
+    """Return supported Python dependency files in deterministic priority order."""
+
+    paths = set(_paths_from_repository(repository))
+    manifests = set(_manifest_contents_from_repository(repository))
+    candidates = paths | manifests
+
+    priority = {
+        "requirements.txt": 0,
+        "requirements-dev.txt": 1,
+        "pyproject.toml": 2,
+        "setup.py": 3,
+        "setup.cfg": 4,
+    }
+
+    def dependency_priority(path: str) -> tuple[int, int, str]:
+        normalized = _normalize_path(path)
+        basename = _path_basename(normalized)
+        if basename == "requirements.txt":
+            file_priority = priority["requirements.txt"]
+        elif basename.startswith("requirements-") and basename.endswith(".txt"):
+            file_priority = 1
+        else:
+            file_priority = priority.get(basename, 99)
+
+        workdir = _normalize_path(working_directory)
+        if workdir:
+            in_workdir = normalized == workdir or normalized.startswith(f"{workdir}/")
+        else:
+            in_workdir = "/" not in normalized
+
+        return (0 if in_workdir else 1, file_priority, normalized)
+
+    def is_supported(path: str) -> bool:
+        basename = _path_basename(path)
+        return (
+            basename.startswith("requirements")
+            and basename.endswith(".txt")
+        ) or basename in {
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+        }
+
+    selected = [path for path in candidates if is_supported(path)]
+    return tuple(sorted(set(selected), key=dependency_priority))
+
+
+def _install_command_for_dependency(
+    dependency_file: str,
+    *,
+    working_directory: str,
+    install_drf_spectacular: bool,
+) -> str:
+    """Build a pip install command relative to the adapter working directory."""
+
+    dependency_file = _normalize_path(dependency_file)
+    working_directory = _normalize_path(working_directory) or "."
+    relative_dependency = posixpath.relpath(
+        dependency_file,
+        working_directory,
+    )
+
+    basename = _path_basename(dependency_file)
+
+    if basename.startswith("requirements") and basename.endswith(".txt"):
+        command = f"python -m pip install -r {relative_dependency}"
+    elif basename in {"pyproject.toml", "setup.py", "setup.cfg"}:
+        dependency_directory = PurePosixPath(dependency_file).parent
+        relative_project = posixpath.relpath(
+            str(dependency_directory),
+            working_directory,
+        )
+        if relative_project == ".":
+            relative_project = "."
+        command = f"python -m pip install {relative_project}"
+    else:
+        command = ""
+
+    if install_drf_spectacular:
+        command = (
+            f"{command} && " if command else ""
+        ) + "python -m pip install drf-spectacular"
+
+    return command
+
+
+def _drf_spectacular_present(
+    repository: Mapping[str, Any],
+) -> bool:
+    manifest_text = "\n".join(
+        _manifest_contents_from_repository(repository).values()
+    ).lower()
+
+    return (
+        "drf-spectacular" in manifest_text
+        or "drf_spectacular" in manifest_text
+    )
+
+
 def _validate_commit_sha(
     commit_sha: str,
 ) -> str:
@@ -663,23 +772,27 @@ class DjangoRESTFrameworkAdapter(
         self,
         repository: Mapping[str, Any],
     ) -> bool:
-        """
-        Return whether this repository can be handled automatically by the
-        DRF adapter.
+        """Return whether deterministic CI generation can be prepared."""
 
-        We consider a DRF repository generation-capable when Django + DRF are
-        detectable.
+        detection = self.detect(repository)
+        if not detection.detected:
+            return False
 
-        drf-spectacular does not have to be present yet because the setup
-        planner can install/configure it as part of automated onboarding.
-        """
+        paths = _paths_from_repository(repository)
+        manage_py = _find_manage_py(paths)
+        if not manage_py:
+            return False
 
-        detection = self.detect(
-            repository
-        )
-
+        # The centralized action currently knows how to bootstrap pip-based
+        # Python repositories. Require a supported dependency manifest when
+        # automated generation is requested so we do not create a workflow
+        # that will deterministically fail at dependency installation time.
+        working_directory = _path_directory(manage_py)
         return bool(
-            detection.detected
+            _dependency_files_for_repository(
+                repository,
+                working_directory=working_directory,
+            )
         )
 
     # ------------------------------------------------------------------
@@ -692,112 +805,103 @@ class DjangoRESTFrameworkAdapter(
         *,
         commit_sha: str,
     ) -> ContractGenerationPlan:
-        """
-        Create a deterministic contract-generation plan.
+        """Create the complete runtime-aware DRF contract generation plan."""
 
-        The method does NOT execute code.
+        if not isinstance(repository, Mapping):
+            raise ValueError("Repository metadata is invalid.")
 
-        The exact commit SHA is required because branch names are mutable.
-
-        The resulting command assumes that the setup phase has made
-        drf-spectacular available and configured it as DRF's schema class.
-        """
-
-        if not isinstance(
-            repository,
-            Mapping,
-        ):
-            raise ValueError(
-                "Repository metadata is invalid."
-            )
-
-        validated_sha = _validate_commit_sha(
-            commit_sha
-        )
-
-        detection = self.detect(
-            repository
-        )
+        validated_sha = _validate_commit_sha(commit_sha)
+        detection = self.detect(repository)
 
         if not detection.detected:
             return ContractGenerationPlan(
                 supported=False,
                 adapter_type=self.adapter_type,
+                language=self.language,
+                package_manager=PACKAGE_MANAGER,
+                adapter_name=self.adapter_type,
+                adapter_version=ADAPTER_VERSION,
                 reason=(
                     "Django REST Framework was not detected. "
                     "Contract generation cannot be prepared."
                 ),
             )
 
-        paths = _paths_from_repository(
-            repository
+        paths = _paths_from_repository(repository)
+        manage_py = _find_manage_py(paths)
+        if not manage_py:
+            return ContractGenerationPlan(
+                supported=False,
+                adapter_type=self.adapter_type,
+                language=self.language,
+                package_manager=PACKAGE_MANAGER,
+                adapter_name=self.adapter_type,
+                adapter_version=ADAPTER_VERSION,
+                warnings=(
+                    "manage.py was not found in the scanned repository tree.",
+                ),
+                reason=(
+                    "Django REST Framework was detected, but automated contract "
+                    "generation requires a repository-local manage.py entry point."
+                ),
+            )
+
+        working_directory = _path_directory(manage_py)
+        dependency_files = _dependency_files_for_repository(
+            repository,
+            working_directory=working_directory,
         )
 
-        manage_py = _find_manage_py(
-            paths
-        )
+        if not dependency_files:
+            return ContractGenerationPlan(
+                supported=False,
+                adapter_type=self.adapter_type,
+                language=self.language,
+                package_manager=PACKAGE_MANAGER,
+                working_directory=working_directory,
+                adapter_name=self.adapter_type,
+                adapter_version=ADAPTER_VERSION,
+                warnings=(
+                    "No supported Python dependency manifest was found.",
+                ),
+                reason=(
+                    "Django REST Framework was detected, but the centralized "
+                    "CI runtime currently requires a supported pip dependency "
+                    "manifest for automatic setup."
+                ),
+            )
 
         warnings: list[str] = []
-
-        if not manage_py:
+        spectacular_present = _drf_spectacular_present(repository)
+        if not spectacular_present:
             warnings.append(
-                "manage.py was not found in the scanned repository tree. "
-                "The setup planner must determine the Django project entry point."
+                "drf-spectacular was not found in the scanned dependency manifests. "
+                "The CI runtime plan will install it before contract generation."
             )
 
-        working_directory = _path_directory(
-            manage_py
-        )
-
-        # Generate the contract inside the Django project directory.
-        # The repository-relative output remains deterministic.
+        # The contract is generated at repository root so the setup service can
+        # use the same deterministic default spec path for generated contracts.
         output_path = DEFAULT_OUTPUT_PATH
-
-        if working_directory:
-            repository_output_path = (
-                f"{working_directory}/{output_path}"
-            )
-        else:
-            repository_output_path = output_path
-
-        manifest_contents = (
-            _manifest_contents_from_repository(
-                repository
-            )
+        command = (
+            f"python {manage_py} spectacular "
+            f"--file {output_path} --validate"
         )
 
-        manifest_text = "\n".join(
-            manifest_contents.values()
-        ).lower()
-
-        drf_spectacular_present = (
-            "drf-spectacular" in manifest_text
-            or "drf_spectacular" in manifest_text
-        )
-
-        if not drf_spectacular_present:
-            warnings.append(
-                "drf-spectacular was not found in the scanned dependency "
-                "manifests. Automated setup must install and configure it "
-                "before this generation command runs."
-            )
-
-        if manage_py:
-            command = (
-                f"python manage.py spectacular "
-                f"--file {output_path} "
-                f"--validate"
+        if dependency_files:
+            install_command = _install_command_for_dependency(
+                dependency_files[0],
+                working_directory=working_directory,
+                install_drf_spectacular=not spectacular_present,
             )
         else:
-            command = (
-                "python manage.py spectacular "
-                "--file openapi.json "
-                "--validate"
+            # Keep the plan explicit even though can_generate_contract() will
+            # normally reject repositories without a supported manifest.
+            install_command = (
+                "python -m pip install drf-spectacular"
+                if not spectacular_present
+                else ""
             )
 
-        # The SHA is intentionally referenced in the warning/metadata rather
-        # than interpolated into a shell command. CI is responsible for
-        # checking out the exact revision before executing the plan.
         warnings.append(
             f"Contract must be generated from exact commit {validated_sha}."
         )
@@ -805,16 +909,20 @@ class DjangoRESTFrameworkAdapter(
         return ContractGenerationPlan(
             supported=True,
             adapter_type=self.adapter_type,
+            language=self.language,
+            package_manager=PACKAGE_MANAGER,
+            dependency_files=dependency_files,
             command=command,
-            output_path=repository_output_path,
+            output_path=output_path,
             working_directory=working_directory,
+            install_command=install_command,
             environment={},
-            warnings=tuple(
-                warnings
-            ),
+            adapter_name=self.adapter_type,
+            adapter_version=ADAPTER_VERSION,
+            warnings=tuple(warnings),
             reason=(
-                "Generate an OpenAPI contract using drf-spectacular "
-                "for the exact repository revision."
+                "Generate an OpenAPI contract with drf-spectacular from the "
+                "exact repository revision using a pip-based CI runtime plan."
             ),
         )
 
@@ -1057,8 +1165,11 @@ class DjangoRESTFrameworkAdapter(
 
         return {
             "adapter_type": self.adapter_type,
+            "adapter_name": self.adapter_type,
+            "adapter_version": ADAPTER_VERSION,
             "framework_name": self.framework_name,
             "language": self.language,
+            "package_manager": PACKAGE_MANAGER,
             "contract_generator": "drf-spectacular",
             "default_contract_format": "OpenAPI",
             "default_output_path": DEFAULT_OUTPUT_PATH,
