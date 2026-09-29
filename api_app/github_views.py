@@ -229,6 +229,23 @@ class GitHubInstallStartView(APIView):
             expires_at=now + timedelta(seconds=ttl),
         )
 
+        # Start with GitHub user authorization rather than sending every user
+        # directly to the installation page. This is important for an App that
+        # is already installed: GitHub may send an already-installed user to
+        # /settings/installations/<id>, where there is no OAuth callback back to
+        # API Analyzer after the repository selection is saved.
+        authorize_url = (
+            "https://github.com/login/oauth/authorize?"
+            f"{urlencode({
+                'client_id': client.client_id,
+                'redirect_uri': client.callback_url,
+                'state': raw_state,
+            })}"
+        )
+
+        # Keep the install URL as a backend fallback. If OAuth discovers that
+        # the GitHub App is not installed for this user, the callback can send
+        # the same pending state into the normal installation flow.
         install_url = (
             f"https://github.com/apps/{client.app_slug}/installations/new?"
             f"{urlencode({'state': raw_state})}"
@@ -236,7 +253,10 @@ class GitHubInstallStartView(APIView):
 
         return Response(
             {
+                "authorize_url": authorize_url,
+                "oauth_url": authorize_url,
                 "install_url": install_url,
+                "flow": "oauth-first",
                 "project_id": project.id,
                 "expires_in": ttl,
             },
@@ -295,7 +315,172 @@ class GitHubInstallCallbackView(APIView):
             )
 
         try:
-            # Consume the state exactly once.
+            client = GitHubAppClient()
+
+            # --------------------------------------------------------------
+            # 1. Exchange the GitHub OAuth code for a user access token.
+            # --------------------------------------------------------------
+            oauth = client.exchange_user_code(code)
+            user_access_token = str(oauth["access_token"])
+
+            # --------------------------------------------------------------
+            # 2. Identify the GitHub user who authorized API Analyzer.
+            # --------------------------------------------------------------
+            github_user = client.get_authenticated_user(
+                user_access_token
+            )
+
+            github_login = str(
+                github_user.get("login") or ""
+            ).strip()
+
+            if not github_login:
+                raise GitHubAPIError(
+                    "GitHub authorization did not return a username."
+                )
+
+            # --------------------------------------------------------------
+            # 3. Look for an existing installation visible to this user.
+            #
+            # We deliberately use the authenticated GitHub user token here.
+            # That lets the same flow handle an App installed on a personal
+            # account or on an organization where the user has access.
+            # --------------------------------------------------------------
+            installations = client.get_user_installations(
+                user_access_token
+            )
+
+            app_installations = []
+            for item in installations:
+                try:
+                    item_app_id = int(item.get("app_id"))
+                except (TypeError, ValueError):
+                    continue
+
+                if item_app_id != client.app_id:
+                    continue
+
+                installation_id_value = item.get("id")
+                try:
+                    item_installation_id = int(installation_id_value)
+                except (TypeError, ValueError):
+                    continue
+
+                if item_installation_id <= 0:
+                    continue
+
+                app_installations.append(item)
+
+            # GitHub can include installation_id in an installation callback.
+            # When it is present, use it only after verifying it belongs to the
+            # authenticated user and to this GitHub App.
+            callback_installation_id = request.query_params.get(
+                "installation_id"
+            )
+            selected_installation = None
+
+            if callback_installation_id:
+                try:
+                    callback_installation_id = int(
+                        callback_installation_id
+                    )
+                except (TypeError, ValueError):
+                    callback_installation_id = None
+
+                if callback_installation_id:
+                    selected_installation = next(
+                        (
+                            item
+                            for item in app_installations
+                            if int(item.get("id"))
+                            == callback_installation_id
+                        ),
+                        None,
+                    )
+
+            # When GitHub does not return an installation id, prefer an
+            # installation whose account matches the repository owner already
+            # known on the Analyzer project. This is useful for org installs.
+            if selected_installation is None:
+                project_repository = str(
+                    state_record.project.repository_full_name or ""
+                ).strip()
+                repository_owner = (
+                    project_repository.split("/", 1)[0].strip().lower()
+                    if "/" in project_repository
+                    else ""
+                )
+
+                if repository_owner:
+                    owner_matches = [
+                        item
+                        for item in app_installations
+                        if str(
+                            (item.get("account") or {}).get("login") or ""
+                        ).strip().lower()
+                        == repository_owner
+                    ]
+                    if len(owner_matches) == 1:
+                        selected_installation = owner_matches[0]
+
+            # If there is exactly one visible installation for this App, there
+            # is no ambiguity and we can bind it to the Analyzer project.
+            if selected_installation is None and len(app_installations) == 1:
+                selected_installation = app_installations[0]
+
+            # --------------------------------------------------------------
+            # 4. If the user authorized GitHub but the App is not installed,
+            #    continue into the installation flow using the SAME pending
+            #    state. The state remains unconsumed until the installation is
+            #    successfully discovered and verified. This is the key fix for
+            #    old accounts: they no longer start from the already-installed
+            #    GitHub settings page.
+            # --------------------------------------------------------------
+            if selected_installation is None:
+                install_url = (
+                    f"https://github.com/apps/{client.app_slug}/installations/new?"
+                    f"{urlencode({'state': state})}"
+                )
+
+                return HttpResponseRedirect(install_url)
+
+            # --------------------------------------------------------------
+            # 5. Read and validate installation id.
+            # --------------------------------------------------------------
+            try:
+                installation_id = int(
+                    selected_installation.get("id")
+                )
+            except (TypeError, ValueError) as exc:
+                raise GitHubAPIError(
+                    "GitHub returned an invalid installation ID."
+                ) from exc
+
+            if installation_id <= 0:
+                raise GitHubAPIError(
+                    "GitHub returned an invalid installation ID."
+                )
+
+            try:
+                installation_app_id = int(
+                    selected_installation.get("app_id")
+                )
+            except (TypeError, ValueError) as exc:
+                raise GitHubAPIError(
+                    "GitHub installation does not contain "
+                    "a valid App ID."
+                ) from exc
+
+            if installation_app_id != client.app_id:
+                raise GitHubAPIError(
+                    "The installation does not belong "
+                    "to this GitHub App."
+                )
+
+            # --------------------------------------------------------------
+            # 6. Only consume the state after the installation has been
+            #    positively identified and verified.
+            # --------------------------------------------------------------
             with transaction.atomic():
                 locked_state = (
                     GitHubInstallState.objects
@@ -323,154 +508,36 @@ class GitHubInstallCallbackView(APIView):
                     ]
                 )
 
-            client = GitHubAppClient()
-
             # --------------------------------------------------------------
-            # 1. Exchange OAuth code for GitHub user access token.
+            # 7. Store installation metadata.
             # --------------------------------------------------------------
-            oauth = client.exchange_user_code(code)
-
-            user_access_token = str(
-                oauth["access_token"]
-            )
-
-            # --------------------------------------------------------------
-            # 2. Get the GitHub user who authorized the App.
-            # --------------------------------------------------------------
-            github_user = client.get_authenticated_user(
-                user_access_token
-            )
-
-            github_login = str(
-                github_user.get("login") or ""
-            ).strip()
-
-            if not github_login:
-                raise GitHubAPIError(
-                    "GitHub authorization did not return a username."
-                )
-
-            # --------------------------------------------------------------
-            # 3. Find this App's installation for the GitHub user.
-            #
-            # This uses:
-            # GET /users/{username}/installation
-            #
-            # It avoids relying on the installation_id being present
-            # in the OAuth callback query parameters.
-            # --------------------------------------------------------------
-            installation = client.get_user_installation(
-                github_login
-            )
-
-            if not installation:
-                raise GitHubAPIError(
-                    "No API Analyzer installation was found "
-                    "for the authorized GitHub user."
-                )
-
-            # --------------------------------------------------------------
-            # 4. Read and validate installation ID.
-            # --------------------------------------------------------------
-            try:
-                installation_id = int(
-                    installation.get("id")
-                )
-            except (TypeError, ValueError) as exc:
-                raise GitHubAPIError(
-                    "GitHub returned an invalid installation ID."
-                ) from exc
-
-            if installation_id <= 0:
-                raise GitHubAPIError(
-                    "GitHub returned an invalid installation ID."
-                )
-
-            # --------------------------------------------------------------
-            # 5. Verify that the installation belongs to this App.
-            # --------------------------------------------------------------
-            try:
-                installation_app_id = int(
-                    installation.get("app_id")
-                )
-            except (TypeError, ValueError) as exc:
-                raise GitHubAPIError(
-                    "GitHub installation does not contain "
-                    "a valid App ID."
-                ) from exc
-
-            if installation_app_id != client.app_id:
-                raise GitHubAPIError(
-                    "The installation does not belong "
-                    "to this GitHub App."
-                )
-
-            # --------------------------------------------------------------
-            # 6. Store installation metadata.
-            # --------------------------------------------------------------
-            account = (
-                installation.get("account")
-                or {}
-            )
+            account = selected_installation.get("account") or {}
 
             metadata = {
-                "account_login": (
-                    account.get("login")
-                    or ""
-                ),
+                "account_login": account.get("login") or "",
                 "account_id": account.get("id"),
-                "account_type": (
-                    account.get("type")
-                    or ""
-                ),
-                "target_type": (
-                    installation.get("target_type")
-                    or ""
-                ),
-                "repository_selection": (
-                    installation.get(
-                        "repository_selection"
-                    )
-                    or ""
-                ),
-                "permissions": (
-                    installation.get("permissions")
-                    or {}
-                ),
-                "events": (
-                    installation.get("events")
-                    or []
-                ),
-                "app_slug": (
-                    installation.get("app_slug")
-                    or client.app_slug
-                ),
+                "account_type": account.get("type") or "",
+                "target_type": selected_installation.get("target_type") or "",
+                "repository_selection": selected_installation.get(
+                    "repository_selection"
+                ) or "",
+                "permissions": selected_installation.get("permissions") or {},
+                "events": selected_installation.get("events") or [],
+                "app_slug": selected_installation.get("app_slug") or client.app_slug,
                 "github_authorized_user_login": github_login,
-                "github_authorized_user_id": (
-                    github_user.get("id")
-                ),
+                "github_authorized_user_id": github_user.get("id"),
             }
 
-            # --------------------------------------------------------------
-            # 7. Save the GitHub App installation for this project.
-            # --------------------------------------------------------------
-            connection, _ = (
-                GitHubConnection.objects.update_or_create(
-                    project=state_record.project,
-                    defaults={
-                        "installation_id": str(
-                            installation_id
-                        ),
-                        "repository_full_name": "",
-                        "connected": False,
-                        "metadata": metadata,
-                    },
-                )
+            connection, _ = GitHubConnection.objects.update_or_create(
+                project=state_record.project,
+                defaults={
+                    "installation_id": str(installation_id),
+                    "repository_full_name": "",
+                    "connected": False,
+                    "metadata": metadata,
+                },
             )
 
-            # --------------------------------------------------------------
-            # 8. Audit log.
-            # --------------------------------------------------------------
             AuditLog.objects.create(
                 project=state_record.project,
                 actor=state_record.project.owner,
@@ -478,18 +545,12 @@ class GitHubInstallCallbackView(APIView):
                 resource_type="GitHubConnection",
                 resource_id=str(connection.pk),
                 metadata={
-                    "installation_id": str(
-                        installation_id
-                    ),
-                    "account_login": metadata.get(
-                        "account_login",
-                        "",
-                    ),
+                    "installation_id": str(installation_id),
+                    "account_login": metadata.get("account_login", ""),
+                    "flow": "oauth-first",
                 },
             )
 
-            # Installation is connected.
-            # Repository selection comes next.
             return HttpResponseRedirect(
                 _frontend_result_url(
                     True,
