@@ -11,6 +11,7 @@ the setup plan itself.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 from .github_service import (
@@ -76,7 +77,7 @@ class GitHubWriteService:
 
         Steps:
         1. Create a GitHub App installation token.
-        2. Create the setup branch from the configured base branch.
+        2. Create the setup branch from the exact scanned commit SHA.
         3. Write every setup file to that branch.
         4. Create the setup pull request.
 
@@ -112,7 +113,7 @@ class GitHubWriteService:
                 installation_token,
                 plan.repository,
                 branch_name=plan.branch_name,
-                from_branch=plan.base_branch,
+                from_sha=plan.base_commit_sha,
             )
 
             for setup_file in plan.files:
@@ -164,6 +165,7 @@ class GitHubWriteService:
                     "review_required": True,
                     "adapter_type": plan.adapter_type,
                     "framework_name": plan.framework_name,
+                    "base_commit_sha": plan.base_commit_sha,
                     "spec_path": plan.spec_path,
                 },
             )
@@ -239,6 +241,14 @@ class GitHubWriteService:
         if not plan.base_branch.strip():
             raise ValueError(
                 "Setup plan base_branch cannot be empty."
+            )
+
+        if not re.fullmatch(
+            r"[0-9a-fA-F]{40,64}",
+            str(getattr(plan, "base_commit_sha", "") or "").strip(),
+        ):
+            raise ValueError(
+                "Setup plan base_commit_sha must be a valid Git commit SHA."
             )
 
         if not plan.branch_name.strip():
