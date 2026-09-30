@@ -33,6 +33,7 @@ sufficient Django REST Framework evidence.
 
 import posixpath
 import re
+import shlex
 from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
 from typing import Any
@@ -477,7 +478,10 @@ def _install_command_for_dependency(
         )
         if relative_project == ".":
             relative_project = "."
-        command = f"python -m pip install {relative_project}"
+        command = (
+            "python -m pip install "
+            f"{shlex.quote(relative_project)}"
+        )
     else:
         command = ""
 
@@ -881,10 +885,24 @@ class DjangoRESTFrameworkAdapter(
 
         # The contract is generated at repository root so the setup service can
         # use the same deterministic default spec path for generated contracts.
-        output_path = DEFAULT_OUTPUT_PATH
+        # The command executes from working_directory (the directory that
+        # contains manage.py), so the invocation must be relative to that
+        # directory. Paths are shell-quoted because repository paths are
+        # untrusted input and the centralized action executes this command.
+        manage_command = shlex.quote(
+            PurePosixPath(manage_py).name
+        )
+        output_path = (
+            posixpath.join(working_directory, DEFAULT_OUTPUT_PATH)
+            if working_directory
+            else DEFAULT_OUTPUT_PATH
+        )
+        relative_output_path = (
+            posixpath.relpath(output_path, working_directory or ".")
+        )
         command = (
-            f"python {manage_py} spectacular "
-            f"--file {output_path} --validate"
+            f"python {manage_command} spectacular "
+            f"--file {shlex.quote(relative_output_path)} --validate"
         )
 
         if dependency_files:
