@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -9,6 +10,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from .execution_policy import decide_execution
+from .adapters.registry import AdapterRegistry
 from .models import (
     APISpecification,
     AnalysisJob,
@@ -72,6 +74,11 @@ def _validate_spec(
     if not isinstance(content, Mapping):
         raise CIValidationError(
             f"{name}.content must be an object."
+        )
+
+    if not content.get("openapi") and not content.get("swagger"):
+        raise CIValidationError(
+            f"{name}.content must declare an OpenAPI or Swagger version."
         )
 
     return result
@@ -159,6 +166,16 @@ def _validate_payload(
             "head_sha is too long."
         )
 
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", base_sha):
+        raise CIValidationError(
+            "base_sha must be a valid Git commit SHA."
+        )
+
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head_sha):
+        raise CIValidationError(
+            "head_sha must be a valid Git commit SHA."
+        )
+
     pull_request = payload.get("pull_request")
 
     if pull_request is not None:
@@ -237,6 +254,67 @@ def _validate_payload(
         generator_warnings=generator_warnings,
         adapter=dict(adapter),
     )
+
+
+def _resolve_ci_adapter(
+    project: Project,
+    adapter_payload: Mapping[str, Any],
+):
+    """Resolve the registered adapter named by the CI action or project."""
+    payload_name = str(
+        adapter_payload.get("name")
+        or adapter_payload.get("adapter_type")
+        or ""
+    ).strip()
+    project_name = str(
+        getattr(project, "adapter_type", "") or ""
+    ).strip()
+
+    legacy_names = {"", "customer-action"}
+    if (
+        payload_name
+        and project_name
+        and payload_name not in legacy_names
+        and payload_name != project_name
+    ):
+        raise CIValidationError(
+            "CI adapter does not match the configured project adapter."
+        )
+
+    adapter_name = payload_name or project_name
+
+    if not adapter_name:
+        return None
+
+    registry = AdapterRegistry.with_defaults()
+    adapter = registry.get(adapter_name)
+    if adapter is None:
+        raise CIValidationError(
+            f"Unsupported API Analyzer adapter '{adapter_name}'."
+        )
+
+    return adapter
+
+
+def _validate_contract_with_adapter(
+    adapter,
+    contract_payload: Mapping[str, Any],
+    name: str,
+) -> None:
+    """Run adapter-specific contract validation before analysis."""
+    if adapter is None:
+        return
+
+    content = contract_payload.get("content")
+    result = adapter.validate_contract(content)
+
+    if not getattr(result, "valid", False):
+        errors = list(getattr(result, "errors", ()) or ())
+        message = "; ".join(str(item).strip() for item in errors if str(item).strip())
+        raise CIValidationError(
+            f"{name} failed adapter contract validation"
+            + (f": {message}" if message else ".")
+        )
 
 
 def _existing_submission(
@@ -435,6 +513,22 @@ def create_ci_submission(
         raise CIValidationError(
             "project_id does not match the authenticated project."
         )
+
+    adapter = _resolve_ci_adapter(
+        project,
+        submission.adapter,
+    )
+
+    _validate_contract_with_adapter(
+        adapter,
+        submission.base_spec,
+        "base_spec",
+    )
+    _validate_contract_with_adapter(
+        adapter,
+        submission.head_spec,
+        "head_spec",
+    )
 
     existing_comparison, existing_job = _existing_submission(
         project,
