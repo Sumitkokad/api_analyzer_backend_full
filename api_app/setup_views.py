@@ -1239,6 +1239,15 @@ class GitHubRepositorySetupView(APIView):
             or {}
         )
 
+        source_contents = dict(
+            getattr(
+                scan_result,
+                "source_contents",
+                {},
+            )
+            or {}
+        )
+
         metadata: dict[str, Any] = {
             "repository_full_name": (
                 repository_full_name
@@ -1252,6 +1261,7 @@ class GitHubRepositorySetupView(APIView):
             # Manifest contents are never returned by scan_result.as_dict().
             "tree_paths": list(tree_paths),
             "manifest_contents": manifest_contents,
+            "source_contents": source_contents,
             "source_files": list(tree_paths),
             "warnings": list(
                 scan_result.warnings
