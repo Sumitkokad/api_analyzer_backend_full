@@ -35,6 +35,7 @@ class SetupPlan:
 
     repository: str
     base_branch: str
+    base_commit_sha: str
 
     branch_name: str
     pull_request_title: str
@@ -101,6 +102,10 @@ class RepositorySetupService:
         repository_name = self._repository_name(repository)
         branch = self._normalize_branch(
             base_branch or repository.get("default_branch") or "main"
+        )
+
+        commit_sha = self._normalize_commit_sha(
+            repository.get("commit_sha")
         )
 
         adapter_type = self._adapter_value(adapter, "adapter_type")
@@ -185,6 +190,7 @@ class RepositorySetupService:
             analyzer_action_ref=resolved_action_ref,
             token_secret_name=resolved_token_secret,
             generation_plan=generation_plan,
+            base_commit_sha=commit_sha,
         )
 
         files = (
@@ -204,6 +210,7 @@ class RepositorySetupService:
             analyzer_action_ref=resolved_action_ref,
             token_secret_name=resolved_token_secret,
             contract_source=str(generation_plan.get("source") or "generated"),
+            base_commit_sha=commit_sha,
         )
 
         warnings = self._collect_warnings(
@@ -232,6 +239,7 @@ class RepositorySetupService:
             "framework_agnostic": True,
             "repository": repository_name,
             "base_branch": branch,
+            "base_commit_sha": commit_sha,
             "project_id": resolved_project_id,
             "analyzer_base_url": resolved_analyzer_base_url,
             "analyzer_action_ref": resolved_action_ref,
@@ -245,6 +253,7 @@ class RepositorySetupService:
         return SetupPlan(
             repository=repository_name,
             base_branch=branch,
+            base_commit_sha=commit_sha,
             branch_name=branch_name,
             pull_request_title=pull_request_title,
             pull_request_body=pull_request_body,
@@ -290,6 +299,15 @@ class RepositorySetupService:
         raise ValueError(
             f"Adapter does not provide required attribute '{attribute}'."
         )
+
+    @staticmethod
+    def _normalize_commit_sha(value: Any) -> str:
+        normalized = str(value or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", normalized):
+            raise ValueError(
+                "Repository scan must provide a valid immutable commit SHA."
+            )
+        return normalized
 
     @staticmethod
     def _normalize_branch(branch: str) -> str:
@@ -363,20 +381,33 @@ class RepositorySetupService:
                 "working_directory": ".",
                 "install_command": "",
                 "environment": {},
-                "adapter_name": "committed-contract",
-                "adapter_version": "1",
+                "adapter_name": str(
+                    getattr(adapter, "adapter_type", "")
+                    or "customer-action"
+                ),
+                "adapter_version": str(
+                    getattr(adapter, "version", None)
+                    or "1"
+                ),
             }
 
         try:
             plan = adapter.generate_contract(
                 repository,
-                commit_sha=commit_sha or ("0" * 40),
+                commit_sha=commit_sha,
             )
         except Exception as exc:
             raise ValueError(
                 "Unable to obtain contract generation plan from adapter: "
                 f"{exc}"
             ) from exc
+
+        if not getattr(plan, "supported", True):
+            reason = str(
+                getattr(plan, "reason", "")
+                or "Adapter cannot generate the API contract."
+            ).strip()
+            raise ValueError(reason)
 
         command = getattr(plan, "command", None)
         if not command:
@@ -546,6 +577,7 @@ class RepositorySetupService:
         analyzer_action_ref: str,
         token_secret_name: str,
         generation_plan: Mapping[str, Any],
+        base_commit_sha: str = "",
     ) -> str:
         project_value = (
             str(project_id)
@@ -564,6 +596,7 @@ class RepositorySetupService:
             f"  adapter: {cls._yaml_string(adapter_type)}",
             f"  framework: {cls._yaml_string(framework_name)}",
             f"  spec_path: {cls._yaml_string(spec_path)}",
+            f"  setup_base_commit_sha: {cls._yaml_string(base_commit_sha)}",
             '  baseline_mode: "merge-base"',
             f"  analyzer_base_url: {cls._yaml_string(analyzer_base_url)}",
             f"  analyzer_action: {cls._yaml_string(analyzer_action_ref)}",
@@ -826,6 +859,7 @@ jobs:
         analyzer_action_ref: str,
         token_secret_name: str,
         contract_source: str = "generated",
+        base_commit_sha: str = "",
     ) -> str:
         normalized_source = str(contract_source).strip() or "generated"
         source_description = (
@@ -843,6 +877,7 @@ jobs:
             f"- Framework: `{framework_name}`\n"
             f"- Adapter: `{adapter_type}`\n"
             f"- Contract: `{spec_path}`\n"
+            f"- Setup revision: `{base_commit_sha}`\n"
             "\n"
             "### What will be added\n"
             "\n"
