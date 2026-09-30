@@ -354,9 +354,11 @@ class GitHubRepositorySetupView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        # Automatic onboarding treats GitHub as the source of truth. A stale
+        # project.spec_path must never override a fresh repository scan. An
+        # explicit request override is still supported for advanced use.
         requested_spec_path = str(
             request.data.get("spec_path")
-            or project.spec_path
             or ""
         ).strip()
 
@@ -386,10 +388,9 @@ class GitHubRepositorySetupView(APIView):
 
             scan_result = scanner.scan(
                 repository_full_name,
-                default_branch=(
-                    project.default_branch
-                    or None
-                ),
+                # Resolve the repository's current default branch from GitHub.
+                # Project.default_branch is a cache, not the source of truth.
+                default_branch=None,
             )
 
             repository_metadata = (
@@ -498,12 +499,14 @@ class GitHubRepositorySetupView(APIView):
                     ),
                 )
 
-            existing_branch = self._github_branch_exists(
+            existing_branch_sha = self._github_branch_sha(
                 github_client=github_client,
                 installation_token=installation_token,
                 repository_full_name=repository_full_name,
                 branch_name=setup_plan.branch_name,
             )
+
+            existing_branch = bool(existing_branch_sha)
 
             # Provision the project-scoped GitHub Actions credential before
             # creating the setup PR. The setup workflow created above reads
@@ -523,15 +526,29 @@ class GitHubRepositorySetupView(APIView):
             )
 
             if existing_branch:
-                # A previous attempt may have created the deterministic setup
-                # branch but failed while writing files or creating the PR.
-                # Reuse that branch, finish the files, and create exactly one
-                # setup PR instead of failing on branch creation.
-                execution = self._recover_existing_branch(
-                    github_client=github_client,
-                    installation_token=installation_token,
-                    plan=setup_plan,
-                )
+                # A branch with this deterministic setup name may be left from
+                # an older partial attempt. Reuse it only when it still points
+                # to the exact revision that was just scanned. Otherwise rebuild
+                # it from the immutable scanned commit.
+                if existing_branch_sha == setup_plan.base_commit_sha:
+                    execution = self._recover_existing_branch(
+                        github_client=github_client,
+                        installation_token=installation_token,
+                        plan=setup_plan,
+                    )
+                else:
+                    github_client.delete_branch(
+                        installation_token,
+                        repository_full_name,
+                        setup_plan.branch_name,
+                    )
+                    write_service = GitHubWriteService(
+                        github_client=github_client
+                    )
+                    execution = write_service.execute_setup(
+                        installation_id=installation_id,
+                        plan=setup_plan,
+                    )
             else:
                 write_service = (
                     GitHubWriteService(
@@ -628,14 +645,14 @@ class GitHubRepositorySetupView(APIView):
                         metadata=recovered_metadata,
                     )
                 else:
-                    branch_now_exists = self._github_branch_exists(
+                    branch_now_sha = self._github_branch_sha(
                         github_client=github_client,
                         installation_token=installation_token,
                         repository_full_name=repository_full_name,
                         branch_name=setup_plan.branch_name,
                     )
 
-                    if branch_now_exists:
+                    if branch_now_sha == setup_plan.base_commit_sha:
                         execution = self._recover_existing_branch(
                             github_client=github_client,
                             installation_token=installation_token,
@@ -658,6 +675,7 @@ class GitHubRepositorySetupView(APIView):
                     "repository": repository_full_name,
                     "branch_name": execution.branch_name,
                     "base_branch": execution.base_branch,
+                    "base_commit_sha": setup_plan.base_commit_sha,
                     "files_written": list(
                         execution.files_written
                     ),
@@ -690,6 +708,7 @@ class GitHubRepositorySetupView(APIView):
                     "repository": repository_full_name,
                     "branch_name": execution.branch_name,
                     "base_branch": execution.base_branch,
+                    "base_commit_sha": setup_plan.base_commit_sha,
                     "pull_request_number": (
                         execution.pull_request_number
                     ),
@@ -844,6 +863,9 @@ class GitHubRepositorySetupView(APIView):
                     "base_branch": str(
                         metadata.get("base_branch") or "main"
                     ),
+                    "base_commit_sha": str(
+                        metadata.get("base_commit_sha") or ""
+                    ),
                     "files_written": files_written,
                     "pull_request_number": metadata.get(
                         "pull_request_number"
@@ -934,6 +956,26 @@ class GitHubRepositorySetupView(APIView):
         return pull_requests[0]
 
     @classmethod
+    def _github_branch_sha(
+        cls,
+        *,
+        github_client: GitHubAppClient,
+        installation_token: str,
+        repository_full_name: str,
+        branch_name: str,
+    ) -> str | None:
+        try:
+            return github_client.get_branch_sha(
+                installation_token,
+                repository_full_name,
+                branch_name,
+            )
+        except GitHubAPIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
+    @classmethod
     def _github_branch_exists(
         cls,
         *,
@@ -942,27 +984,12 @@ class GitHubRepositorySetupView(APIView):
         repository_full_name: str,
         branch_name: str,
     ) -> bool:
-        owner, repo = cls._github_parts(
-            repository_full_name
-        )
-
-        path = (
-            f"/repos/{owner}/{repo}/git/ref/heads/"
-            f"{quote(str(branch_name).strip(), safe='/')}"
-        )
-
-        try:
-            data = github_client._request(
-                "GET",
-                path,
-                authorization=f"Bearer {installation_token}",
-            )
-        except GitHubAPIError as exc:
-            if exc.status_code == 404:
-                return False
-            raise
-
-        return isinstance(data, dict)
+        return cls._github_branch_sha(
+            github_client=github_client,
+            installation_token=installation_token,
+            repository_full_name=repository_full_name,
+            branch_name=branch_name,
+        ) is not None
 
     @staticmethod
     def _metadata_from_pull_request(
@@ -995,6 +1022,7 @@ class GitHubRepositorySetupView(APIView):
             "repository": setup_plan.repository,
             "branch_name": setup_plan.branch_name,
             "base_branch": actual_base or setup_plan.base_branch,
+            "base_commit_sha": setup_plan.base_commit_sha,
             "pull_request_number": pull_request_number,
             "pull_request_url": pull_request_url,
             "adapter_type": setup_plan.adapter_type,
@@ -1254,9 +1282,11 @@ class GitHubRepositorySetupView(APIView):
             ),
             "default_branch": (
                 scan_result.default_branch
-                or project.default_branch
                 or "main"
             ),
+            "commit_sha": str(
+                getattr(scan_result, "commit_sha", "") or ""
+            ).strip(),
             # Internal scanner evidence is passed to the adapter registry.
             # Manifest contents are never returned by scan_result.as_dict().
             "tree_paths": list(tree_paths),
@@ -1293,17 +1323,16 @@ class GitHubRepositorySetupView(APIView):
     ) -> None:
         update_fields: list[str] = []
 
-        if spec_path and project.spec_path != spec_path:
-            project.spec_path = spec_path
+        normalized_spec_path = str(spec_path or "").strip()
+        if project.spec_path != normalized_spec_path:
+            project.spec_path = normalized_spec_path
             update_fields.append(
                 "spec_path"
             )
 
-        if (
-            adapter_type
-            and project.adapter_type != adapter_type
-        ):
-            project.adapter_type = adapter_type
+        normalized_adapter_type = str(adapter_type or "").strip()
+        if project.adapter_type != normalized_adapter_type:
+            project.adapter_type = normalized_adapter_type
             update_fields.append(
                 "adapter_type"
             )
