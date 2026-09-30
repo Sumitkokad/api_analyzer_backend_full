@@ -1,62 +1,60 @@
+"""
+API endpoint for automatic GitHub repository onboarding.
+
+Flow:
+
+Authenticated user
+    -> project
+    -> connected GitHub repository
+    -> repository scan
+    -> adapter detection
+    -> setup plan
+    -> GitHub setup branch
+    -> setup files
+    -> setup pull request
+
+The endpoint never asks the user for a GitHub PAT or CI token.
+"""
+
 from __future__ import annotations
+from django.http import JsonResponse
+from typing import Any
+from urllib.parse import quote
 
-import secrets
-from datetime import timedelta
-from urllib.parse import urlencode
-
-from django.conf import settings
-from django.db import transaction
-from django.http import HttpResponseRedirect
-from django.utils import timezone
 from rest_framework import status
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .adapters.registry import AdapterRegistry
+from .github_actions_provisioning_service import (
+    GitHubActionsProvisioningService,
+)
+from .github_scan_service import GitHubRepositoryScanner
 from .github_service import (
     GitHubAPIError,
     GitHubAppClient,
     GitHubConfigurationError,
-    hash_install_state,
 )
-from .github_scan_service import GitHubRepositoryScanner
-from .models import (
-    AuditLog,
-    GitHubConnection,
-    GitHubInstallState,
-    Project,
+from .github_write_service import (
+    GitHubWriteService,
+    SetupExecutionResult,
+)
+from .models import AuditLog, GitHubConnection, Project
+from .setup_service import RepositorySetupService
+
+
+SETUP_AUDIT_ACTION = "github_setup_pull_request_created"
+DEFAULT_SETUP_FILES = (
+    ".api-analyzer.yml",
+    ".github/workflows/api-compatibility.yml",
 )
 
 
-def _frontend_result_url(success: bool, **params: object) -> str:
-    """Build the canonical React hash-route URL used after GitHub OAuth.
-
-    The GitHub OAuth callback must land directly on the SPA route. We keep
-    the callback result and project id inside the hash so Netlify serves the
-    same SPA entrypoint and React owns the final navigation state.
-    """
-
-    base = getattr(
-        settings,
-        "GITHUB_APP_FRONTEND_URL",
-        "http://localhost:5173",
-    ).rstrip("/")
-
-    query = {
-        "github": "connected" if success else "error",
-    }
-    query.update(
-        {
-            key: str(value)
-            for key, value in params.items()
-            if value is not None and str(value) != ""
-        }
-    )
-
-    return f"{base}/#/github?{urlencode(query)}"
-
-
-def _project_for_user(request, project_id):
+def _project_for_user(
+    request: Any,
+    project_id: Any,
+) -> Project | None:
     try:
         return Project.objects.get(
             pk=project_id,
@@ -66,797 +64,270 @@ def _project_for_user(request, project_id):
         return None
 
 
-def _serialize_repository(repo: dict) -> dict:
-    owner = repo.get("owner") or {}
-    permissions = repo.get("permissions") or {}
-    return {
-        "id": repo.get("id"),
-        "name": repo.get("name"),
-        "full_name": repo.get("full_name"),
-        "private": bool(repo.get("private")),
-        "html_url": repo.get("html_url"),
-        "default_branch": repo.get("default_branch") or "",
-        "owner": owner.get("login") or "",
-        "visibility": repo.get("visibility") or "",
-        "permissions": permissions,
-    }
+class GitHubRepositorySetupView(APIView):
+    """
+    Create the API Analyzer setup pull request for a connected repository.
 
-
-class GitHubInstallStartView(APIView):
-    """Create a one-time state and return the GitHub App install URL."""
+    The request only needs the project ID. Repository, installation,
+    framework, and contract information are obtained from the existing
+    GitHub App connection and repository scan.
+    """
 
     permission_classes = (IsAuthenticated,)
 
-    def get(self, request):
-        project_id = request.query_params.get("project_id")
-        if not project_id:
-            return Response(
-                {"detail": "project_id is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+    def get(self, request, project_id=None):
+        """
+        Return the persisted one-time setup state without changing GitHub.
 
-        project = _project_for_user(request, project_id)
-        if project is None:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
+        This lets the frontend restore the correct disabled state after a
+        page refresh while keeping POST responsible for setup creation or
+        recovery.
+        """
         try:
-            client = GitHubAppClient()
-            client.app_slug
-            client.callback_url
-            client.client_id
-        except GitHubConfigurationError:
-            return Response(
-                {"detail": "GitHub App is not configured on the server."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            selected_project_id = (
+                project_id
+                or request.query_params.get("project_id")
             )
 
-        # The current project may already contain a valid installation record
-        # even if the client is operating from a stale browser state. Return
-        # that state instead of creating a second installation flow.
-        current_connection = getattr(project, "github_connection", None)
-        if current_connection is not None and str(
-            current_connection.installation_id or ""
-        ).strip():
-            return Response(
-                {
-                    "already_connected": True,
-                    "reused_existing_installation": False,
-                    "project_id": project.id,
-                    "installation_id": str(
-                        current_connection.installation_id
-                    ),
-                    "repository_full_name": (
-                        current_connection.repository_full_name or ""
-                    ),
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        # Reuse an existing installation owned by this same Analyzer user
-        # when one is already recorded. This avoids sending an already
-        # authorized user back through GitHub just because they created a
-        # second Analyzer project. The repository is intentionally cleared
-        # so the user still chooses which repository belongs to this project.
-        existing_connections = (
-            GitHubConnection.objects
-            .filter(project__owner=request.user)
-            .exclude(project_id=project.id)
-            .order_by("-updated_at")[:50]
-        )
-
-        reusable = []
-        for candidate in existing_connections:
-            installation_id = str(candidate.installation_id or "").strip()
-            if not installation_id:
-                continue
-
-            metadata = candidate.metadata or {}
-            app_slug = str(metadata.get("app_slug") or "").strip()
-
-            if app_slug and app_slug != client.app_slug:
-                continue
-
-            reusable.append(candidate)
-
-        installation_ids = {
-            str(candidate.installation_id).strip()
-            for candidate in reusable
-            if str(candidate.installation_id or "").strip()
-        }
-
-        if len(installation_ids) == 1 and reusable:
-            source = reusable[0]
-            connection, _ = GitHubConnection.objects.update_or_create(
-                project=project,
-                defaults={
-                    "installation_id": str(source.installation_id),
-                    "repository_full_name": "",
-                    "connected": False,
-                    "metadata": dict(source.metadata or {}),
-                },
-            )
-
-            AuditLog.objects.create(
-                project=project,
-                actor=request.user,
-                action="github_installation_reused",
-                resource_type="GitHubConnection",
-                resource_id=str(connection.pk),
-                metadata={
-                    "installation_id": str(source.installation_id),
-                    "source_project_id": source.project_id,
-                    "account_login": (source.metadata or {}).get(
-                        "account_login",
-                        "",
-                    ),
-                },
-            )
-
-            return Response(
-                {
-                    "already_connected": True,
-                    "reused_existing_installation": True,
-                    "project_id": project.id,
-                    "installation_id": str(source.installation_id),
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        now = timezone.now()
-        GitHubInstallState.objects.filter(
-            expires_at__lt=now,
-            consumed_at__isnull=True,
-        ).delete()
-
-        raw_state = secrets.token_urlsafe(32)
-        ttl = max(
-            60,
-            int(
-                getattr(
-                    settings,
-                    "GITHUB_INSTALL_STATE_TTL_SECONDS",
-                    600,
-                )
-            ),
-        )
-
-        GitHubInstallState.objects.create(
-            project=project,
-            state_hash=hash_install_state(raw_state),
-            expires_at=now + timedelta(seconds=ttl),
-        )
-
-        # Start with GitHub user authorization rather than sending every user
-        # directly to the installation page. This is important for an App that
-        # is already installed: GitHub may send an already-installed user to
-        # /settings/installations/<id>, where there is no OAuth callback back to
-        # API Analyzer after the repository selection is saved.
-        authorize_url = (
-            "https://github.com/login/oauth/authorize?"
-            f"{urlencode({
-                'client_id': client.client_id,
-                'redirect_uri': client.callback_url,
-                'state': raw_state,
-            })}"
-        )
-
-        # Keep the install URL as a backend fallback. If OAuth discovers that
-        # the GitHub App is not installed for this user, the callback can send
-        # the same pending state into the normal installation flow.
-        install_url = (
-            f"https://github.com/apps/{client.app_slug}/installations/new?"
-            f"{urlencode({'state': raw_state})}"
-        )
-
-        return Response(
-            {
-                "authorize_url": authorize_url,
-                "oauth_url": authorize_url,
-                "install_url": install_url,
-                "flow": "oauth-first",
-                "project_id": project.id,
-                "expires_in": ttl,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-class GitHubInstallCallbackView(APIView):
-    """Handle GitHub App OAuth installation callback."""
-
-    permission_classes = (AllowAny,)
-    authentication_classes = ()
-
-    def get(self, request):
-        state = str(
-            request.query_params.get("state") or ""
-        ).strip()
-
-        code = str(
-            request.query_params.get("code") or ""
-        ).strip()
-
-        if not state:
-            return HttpResponseRedirect(
-                _frontend_result_url(
-                    False,
-                    reason="missing_state",
-                )
-            )
-
-        state_record = (
-            GitHubInstallState.objects
-            .select_related("project")
-            .filter(
-                state_hash=hash_install_state(state),
-                consumed_at__isnull=True,
-                expires_at__gt=timezone.now(),
-            )
-            .first()
-        )
-
-        if state_record is None:
-            return HttpResponseRedirect(
-                _frontend_result_url(
-                    False,
-                    reason="invalid_or_expired_state",
-                )
-            )
-
-        if not code:
-            return HttpResponseRedirect(
-                _frontend_result_url(
-                    False,
-                    project_id=state_record.project_id,
-                    reason="github_authorization_incomplete",
-                )
-            )
-
-        try:
-            client = GitHubAppClient()
-
-            # --------------------------------------------------------------
-            # 1. Exchange the GitHub OAuth code for a user access token.
-            # --------------------------------------------------------------
-            oauth = client.exchange_user_code(code)
-            user_access_token = str(oauth["access_token"])
-
-            # --------------------------------------------------------------
-            # 2. Identify the GitHub user who authorized API Analyzer.
-            # --------------------------------------------------------------
-            github_user = client.get_authenticated_user(
-                user_access_token
-            )
-
-            github_login = str(
-                github_user.get("login") or ""
-            ).strip()
-
-            if not github_login:
-                raise GitHubAPIError(
-                    "GitHub authorization did not return a username."
-                )
-
-            # --------------------------------------------------------------
-            # 3. Look for an existing installation visible to this user.
-            #
-            # We deliberately use the authenticated GitHub user token here.
-            # That lets the same flow handle an App installed on a personal
-            # account or on an organization where the user has access.
-            # --------------------------------------------------------------
-            installations = client.get_user_installations(
-                user_access_token
-            )
-
-            app_installations = []
-            for item in installations:
-                try:
-                    item_app_id = int(item.get("app_id"))
-                except (TypeError, ValueError):
-                    continue
-
-                if item_app_id != client.app_id:
-                    continue
-
-                installation_id_value = item.get("id")
-                try:
-                    item_installation_id = int(installation_id_value)
-                except (TypeError, ValueError):
-                    continue
-
-                if item_installation_id <= 0:
-                    continue
-
-                app_installations.append(item)
-
-            # GitHub can include installation_id in an installation callback.
-            # When it is present, use it only after verifying it belongs to the
-            # authenticated user and to this GitHub App.
-            callback_installation_id = request.query_params.get(
-                "installation_id"
-            )
-            selected_installation = None
-
-            if callback_installation_id:
-                try:
-                    callback_installation_id = int(
-                        callback_installation_id
-                    )
-                except (TypeError, ValueError):
-                    callback_installation_id = None
-
-                if callback_installation_id:
-                    selected_installation = next(
-                        (
-                            item
-                            for item in app_installations
-                            if int(item.get("id"))
-                            == callback_installation_id
-                        ),
-                        None,
-                    )
-
-            # When GitHub does not return an installation id, prefer an
-            # installation whose account matches the repository owner already
-            # known on the Analyzer project. This is useful for org installs.
-            if selected_installation is None:
-                project_repository = str(
-                    state_record.project.repository_full_name or ""
-                ).strip()
-                repository_owner = (
-                    project_repository.split("/", 1)[0].strip().lower()
-                    if "/" in project_repository
-                    else ""
-                )
-
-                if repository_owner:
-                    owner_matches = [
-                        item
-                        for item in app_installations
-                        if str(
-                            (item.get("account") or {}).get("login") or ""
-                        ).strip().lower()
-                        == repository_owner
-                    ]
-                    if len(owner_matches) == 1:
-                        selected_installation = owner_matches[0]
-
-            # If there is exactly one visible installation for this App, there
-            # is no ambiguity and we can bind it to the Analyzer project.
-            if selected_installation is None and len(app_installations) == 1:
-                selected_installation = app_installations[0]
-
-            # --------------------------------------------------------------
-            # 4. If the user authorized GitHub but the App is not installed,
-            #    continue into the installation flow using the SAME pending
-            #    state. The state remains unconsumed until the installation is
-            #    successfully discovered and verified. This is the key fix for
-            #    old accounts: they no longer start from the already-installed
-            #    GitHub settings page.
-            # --------------------------------------------------------------
-            if selected_installation is None:
-                install_url = (
-                    f"https://github.com/apps/{client.app_slug}/installations/new?"
-                    f"{urlencode({'state': state})}"
-                )
-
-                return HttpResponseRedirect(install_url)
-
-            # --------------------------------------------------------------
-            # 5. Read and validate installation id.
-            # --------------------------------------------------------------
-            try:
-                installation_id = int(
-                    selected_installation.get("id")
-                )
-            except (TypeError, ValueError) as exc:
-                raise GitHubAPIError(
-                    "GitHub returned an invalid installation ID."
-                ) from exc
-
-            if installation_id <= 0:
-                raise GitHubAPIError(
-                    "GitHub returned an invalid installation ID."
-                )
-
-            try:
-                installation_app_id = int(
-                    selected_installation.get("app_id")
-                )
-            except (TypeError, ValueError) as exc:
-                raise GitHubAPIError(
-                    "GitHub installation does not contain "
-                    "a valid App ID."
-                ) from exc
-
-            if installation_app_id != client.app_id:
-                raise GitHubAPIError(
-                    "The installation does not belong "
-                    "to this GitHub App."
-                )
-
-            # --------------------------------------------------------------
-            # 6. Only consume the state after the installation has been
-            #    positively identified and verified.
-            # --------------------------------------------------------------
-            with transaction.atomic():
-                locked_state = (
-                    GitHubInstallState.objects
-                    .select_for_update()
-                    .get(pk=state_record.pk)
-                )
-
-                if (
-                    locked_state.consumed_at is not None
-                    or locked_state.expires_at <= timezone.now()
-                ):
-                    return HttpResponseRedirect(
-                        _frontend_result_url(
-                            False,
-                            project_id=state_record.project_id,
-                            reason="invalid_or_expired_state",
-                        )
-                    )
-
-                locked_state.consumed_at = timezone.now()
-                locked_state.save(
-                    update_fields=[
-                        "consumed_at",
-                        "updated_at",
-                    ]
-                )
-
-            # --------------------------------------------------------------
-            # 7. Store installation metadata.
-            # --------------------------------------------------------------
-            account = selected_installation.get("account") or {}
-
-            metadata = {
-                "account_login": account.get("login") or "",
-                "account_id": account.get("id"),
-                "account_type": account.get("type") or "",
-                "target_type": selected_installation.get("target_type") or "",
-                "repository_selection": selected_installation.get(
-                    "repository_selection"
-                ) or "",
-                "permissions": selected_installation.get("permissions") or {},
-                "events": selected_installation.get("events") or [],
-                "app_slug": selected_installation.get("app_slug") or client.app_slug,
-                "github_authorized_user_login": github_login,
-                "github_authorized_user_id": github_user.get("id"),
-            }
-
-            connection, _ = GitHubConnection.objects.update_or_create(
-                project=state_record.project,
-                defaults={
-                    "installation_id": str(installation_id),
-                    "repository_full_name": "",
-                    "connected": False,
-                    "metadata": metadata,
-                },
-            )
-
-            AuditLog.objects.create(
-                project=state_record.project,
-                actor=state_record.project.owner,
-                action="github_installation_connected",
-                resource_type="GitHubConnection",
-                resource_id=str(connection.pk),
-                metadata={
-                    "installation_id": str(installation_id),
-                    "account_login": metadata.get("account_login", ""),
-                    "flow": "oauth-first",
-                },
-            )
-
-            return HttpResponseRedirect(
-                _frontend_result_url(
-                    True,
-                    project_id=state_record.project_id,
-                )
-            )
-
-        except GitHubConfigurationError:
-            return HttpResponseRedirect(
-                _frontend_result_url(
-                    False,
-                    project_id=state_record.project_id,
-                    reason="github_app_not_configured",
-                )
-            )
-
-        except GitHubAPIError:
-            return HttpResponseRedirect(
-                _frontend_result_url(
-                    False,
-                    project_id=state_record.project_id,
-                    reason="github_installation_verification_failed",
-                )
-            )
-
-        except Exception:
-            return HttpResponseRedirect(
-                _frontend_result_url(
-                    False,
-                    project_id=state_record.project_id,
-                    reason="github_connection_failed",
-                )
-            )
-
-class GitHubConnectionView(APIView):
-    permission_classes = (IsAuthenticated,)
-
-    def get(self, request):
-        project_id = request.query_params.get("project_id")
-        project = _project_for_user(request, project_id)
-        if project is None:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        connection = getattr(project, "github_connection", None)
-        if connection is None:
-            return Response(
-                {
-                    "connected": False,
-                    "installation_connected": False,
-                    "repository_full_name": "",
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        return Response(
-            {
-                "connected": bool(connection.connected),
-                "installation_connected": True,
-                "installation_id": connection.installation_id,
-                "repository_full_name": connection.repository_full_name,
-                "metadata": connection.metadata or {},
-            },
-            status=status.HTTP_200_OK,
-        )
-
-
-class GitHubRepositoryListView(APIView):
-    permission_classes = (IsAuthenticated,)
-
-    def get(self, request):
-        project_id = request.query_params.get("project_id")
-        project = _project_for_user(request, project_id)
-        if project is None:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        connection = getattr(project, "github_connection", None)
-        if connection is None or not connection.installation_id:
-            return Response(
-                {"detail": "Connect the GitHub App before listing repositories."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            installation_id = int(connection.installation_id)
-            client = GitHubAppClient()
-            token_data = client.create_installation_token(installation_id)
-            result = client.list_installation_repositories(
-                str(token_data["token"]),
-                page=int(request.query_params.get("page", 1)),
-                per_page=int(request.query_params.get("per_page", 100)),
-            )
-        except (ValueError, TypeError):
-            return Response(
-                {"detail": "Invalid repository pagination parameters."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        except GitHubConfigurationError:
-            return Response(
-                {"detail": "GitHub App is not configured on the server."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        except GitHubAPIError:
-            return Response(
-                {"detail": "Unable to fetch repositories from GitHub."},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
-        repositories = [
-            _serialize_repository(repo)
-            for repo in result.get("repositories", [])
-        ]
-
-        return Response(
-            {
-                "project_id": project.id,
-                "connection": {
-                    "installation_id": connection.installation_id,
-                    "account_login": (connection.metadata or {}).get(
-                        "account_login", ""
-                    ),
-                    "repository_selection": (connection.metadata or {}).get(
-                        "repository_selection", ""
-                    ),
-                },
-                "repositories": repositories,
-                "total_count": result.get("total_count", len(repositories)),
-                "page": int(request.query_params.get("page", 1)),
-                "per_page": int(request.query_params.get("per_page", 100)),
-            },
-            status=status.HTTP_200_OK,
-        )
-
-
-class GitHubRepositoryConnectView(APIView):
-    permission_classes = (IsAuthenticated,)
-
-    def post(self, request):
-        project_id = request.data.get("project_id")
-        repository_full_name = str(
-            request.data.get("repository_full_name") or ""
-        ).strip()
-
-        project = _project_for_user(request, project_id)
-        if project is None:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        if (
-            not repository_full_name
-            or repository_full_name.count("/") != 1
-            or any(not part for part in repository_full_name.split("/"))
-        ):
-            return Response(
-                {
-                    "repository_full_name": (
-                        "Use the owner/repository format."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        connection = getattr(project, "github_connection", None)
-        if connection is None or not connection.installation_id:
-            return Response(
-                {"detail": "Connect the GitHub App before selecting a repository."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            installation_id = int(connection.installation_id)
-            client = GitHubAppClient()
-            token_data = client.create_installation_token(installation_id)
-            repository = client.get_repository(
-                str(token_data["token"]),
-                repository_full_name,
-            )
-        except GitHubConfigurationError:
-            return Response(
-                {"detail": "GitHub App is not configured on the server."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        except GitHubAPIError as exc:
-            if exc.status_code == 404:
+            if not selected_project_id:
                 return Response(
                     {
-                        "detail": (
-                            "This repository is not accessible to the installed "
-                            "GitHub App."
-                        )
+                        "detail": "project_id is required."
                     },
-                    status=status.HTTP_403_FORBIDDEN,
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
-            return Response(
-                {"detail": "Unable to verify the repository on GitHub."},
-                status=status.HTTP_502_BAD_GATEWAY,
+
+            project = _project_for_user(
+                request,
+                selected_project_id,
             )
 
-        if not repository.get("full_name"):
-            return Response(
-                {"detail": "GitHub returned an invalid repository."},
-                status=status.HTTP_502_BAD_GATEWAY,
+            if project is None:
+                return Response(
+                    {
+                        "detail": "Project not found."
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            try:
+                connection = GitHubConnection.objects.get(
+                    project=project
+                )
+            except GitHubConnection.DoesNotExist:
+                return Response(
+                    {
+                        "success": True,
+                        "already_exists": False,
+                        "status": "not_configured",
+                        "repository": "",
+                        "setup": None,
+                        "adapter": None,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            repository_full_name = str(
+                connection.repository_full_name
+                or project.repository_full_name
+                or ""
+            ).strip()
+
+            existing_setup = self._latest_setup_audit(
+                project=project,
+                repository_full_name=repository_full_name,
             )
 
-        metadata = dict(connection.metadata or {})
-        metadata.update(
-            {
-                "repository_id": repository.get("id"),
-                "repository_node_id": repository.get("node_id"),
-                "repository_private": bool(repository.get("private")),
-                "repository_visibility": repository.get("visibility") or "",
-                "repository_html_url": repository.get("html_url") or "",
-                "default_branch": repository.get("default_branch") or "",
-            }
-        )
+            if existing_setup is None:
+                return Response(
+                    {
+                        "success": True,
+                        "already_exists": False,
+                        "status": "not_configured",
+                        "repository": repository_full_name,
+                        "setup": None,
+                        "adapter": None,
+                    },
+                    status=status.HTTP_200_OK,
+                )
 
-        connection.repository_full_name = repository["full_name"]
-        connection.connected = True
-        connection.metadata = metadata
-        connection.save(
-            update_fields=[
-                "repository_full_name",
-                "connected",
-                "metadata",
-                "updated_at",
-            ]
-        )
-
-        project.repository_full_name = repository["full_name"]
-        project.default_branch = repository.get("default_branch") or ""
-        project.save(
-            update_fields=[
-                "repository_full_name",
-                "default_branch",
-                "updated_at",
-            ]
-        )
-
-        AuditLog.objects.create(
-            project=project,
-            actor=request.user,
-            action="github_repository_connected",
-            resource_type="GitHubRepository",
-            resource_id=str(repository.get("id") or repository["full_name"]),
-            metadata={
-                "repository_full_name": repository["full_name"],
-                "default_branch": repository.get("default_branch") or "",
-            },
-        )
-
-        return Response(
-            {
-                "connected": True,
-                "project_id": project.id,
-                "repository": _serialize_repository(repository),
-            },
-            status=status.HTTP_200_OK,
-        )
-
-
-class GitHubRepositoryScanView(APIView):
-    """
-    Scan the selected GitHub repository for an OpenAPI/Swagger contract
-    and supported backend framework.
-
-    This endpoint is read-only with respect to the customer's repository.
-    It only stores the detected setup metadata on the API Analyzer project.
-    """
-
-    permission_classes = (IsAuthenticated,)
-
-    def post(self, request):
-        project_id = request.data.get("project_id")
-        project = _project_for_user(request, project_id)
-
-        if project is None:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
+            metadata = existing_setup.metadata or {}
+            self._store_detected_configuration_from_audit(
+                project=project,
+                metadata=metadata,
             )
 
-        connection = getattr(
-            project,
-            "github_connection",
-            None,
+            return self._response_from_setup_metadata(
+                repository_full_name=repository_full_name,
+                metadata=metadata,
+                already_exists=True,
+                message=(
+                    "API compatibility setup already exists for this "
+                    "repository."
+                ),
+            )
+
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "Unable to read automatic GitHub setup state."
+            )
+
+            return Response(
+                {
+                    "detail": "Unable to read API Analyzer setup state.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def dispatch(self, request, *args, **kwargs):
+        """
+        Last-resort JSON boundary for the complete request lifecycle.
+        """
+        try:
+            return super().dispatch(request, *args, **kwargs)
+
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "UNHANDLED SETUP DISPATCH FAILURE"
+            )
+
+            return JsonResponse(
+                {
+                    "detail": "Automatic repository setup failed before the setup handler completed.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                status=500,
+            )
+
+    def post(self, request, project_id=None):
+        """
+        Public POST entrypoint with a last-resort JSON error boundary.
+
+        This prevents Django's default HTML 500 page from hiding an
+        unexpected exception occurring before/after the setup pipeline.
+        """
+        try:
+            return self._post_impl(
+                request,
+                project_id=project_id,
+            )
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "UNHANDLED SETUP VIEW FAILURE"
+            )
+
+            return Response(
+                {
+                    "detail": "Automatic repository setup failed.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def _post_impl(self, request, *, project_id=None):
+        project_id = (
+            project_id
+            or request.data.get("project_id")
         )
 
-        if (
-            connection is None
-            or not connection.installation_id
-            or not connection.repository_full_name
-        ):
+        if not project_id:
             return Response(
                 {
                     "detail": (
-                        "Select a GitHub repository before scanning it."
+                        "project_id is required."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        project = _project_for_user(
+            request,
+            project_id,
+        )
+
+        if project is None:
+            return Response(
+                {
+                    "detail": "Project not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            connection = (
+                GitHubConnection.objects
+                .get(project=project)
+            )
+        except GitHubConnection.DoesNotExist:
+            return Response(
+                {
+                    "detail": (
+                        "No GitHub App connection exists "
+                        "for this project."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if not connection.connected:
+            return Response(
+                {
+                    "detail": (
+                        "The GitHub repository connection "
+                        "is not active."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        repository_full_name = str(
+            connection.repository_full_name
+            or project.repository_full_name
+            or ""
+        ).strip()
+
+        if not repository_full_name:
+            return Response(
+                {
+                    "detail": (
+                        "No GitHub repository has been selected "
+                        "for this project."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Idempotency guard: setup is a one-time repository operation.
+        # A repeated browser click must return the already-created PR instead
+        # of attempting to recreate the deterministic setup branch.
+        existing_setup = self._latest_setup_audit(
+            project=project,
+            repository_full_name=repository_full_name,
+        )
+
+        if existing_setup is not None:
+            self._store_detected_configuration_from_audit(
+                project=project,
+                metadata=existing_setup.metadata or {},
+            )
+            return self._response_from_setup_metadata(
+                repository_full_name=repository_full_name,
+                metadata=existing_setup.metadata or {},
+                already_exists=True,
+                message=(
+                    "API compatibility setup already exists for this "
+                    "repository."
+                ),
             )
 
         try:
@@ -865,146 +336,1000 @@ class GitHubRepositoryScanView(APIView):
             )
         except (TypeError, ValueError):
             return Response(
-                {"detail": "GitHub installation ID is invalid."},
-                status=status.HTTP_502_BAD_GATEWAY,
+                {
+                    "detail": (
+                        "GitHub installation ID is invalid."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
             )
+
+        if installation_id <= 0:
+            return Response(
+                {
+                    "detail": (
+                        "GitHub installation ID is invalid."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        requested_spec_path = str(
+            request.data.get("spec_path")
+            or project.spec_path
+            or ""
+        ).strip()
 
         try:
-            client = GitHubAppClient()
+            github_client = GitHubAppClient()
 
-            token_data = client.create_installation_token(
-                installation_id
+            token_data = (
+                github_client.create_installation_token(
+                    installation_id
+                )
             )
+
+            installation_token = str(
+                token_data.get("token")
+                or ""
+            ).strip()
+
+            if not installation_token:
+                raise GitHubAPIError(
+                    "GitHub installation token was not returned."
+                )
 
             scanner = GitHubRepositoryScanner(
-                github_client=client,
-                installation_token=str(
-                    token_data["token"]
-                ),
+                github_client=github_client,
+                installation_token=installation_token,
             )
 
-            result = scanner.scan(
-                connection.repository_full_name,
+            scan_result = scanner.scan(
+                repository_full_name,
                 default_branch=(
                     project.default_branch
                     or None
                 ),
             )
 
-            # Store only the detected configuration needed by the
-            # subsequent setup step. The repository itself is never modified.
-            update_fields = []
+            repository_metadata = (
+                self._repository_metadata(
+                    scan_result=scan_result,
+                    repository_full_name=repository_full_name,
+                    project=project,
+                )
+            )
 
-            if result.contract.found:
-                if project.spec_path != result.contract.path:
-                    project.spec_path = result.contract.path
-                    update_fields.append("spec_path")
+            registry = (
+                AdapterRegistry.with_defaults()
+            )
 
-            if result.framework.detected:
-                if project.adapter_type != result.framework.adapter_type:
-                    project.adapter_type = result.framework.adapter_type
-                    update_fields.append("adapter_type")
+            resolution = registry.detect(
+                repository_metadata
+            )
 
-            if update_fields:
-                update_fields.append("updated_at")
-                project.save(update_fields=update_fields)
+            if not resolution.supported:
+                return Response(
+                    {
+                        "detail": (
+                            "The repository was scanned successfully, "
+                            "but no installed API Analyzer adapter "
+                            "supports the detected technology."
+                        ),
+                        "repository": repository_full_name,
+                        "scan": scan_result.as_dict(),
+                        "adapter": None,
+                        "reason": resolution.reason,
+                        "errors": list(
+                            getattr(resolution, "errors", ())
+                            or ()
+                        ),
+                    },
+                    status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+
+            adapter = resolution.adapter
+
+            spec_path = (
+                requested_spec_path
+                or (
+                    scan_result.contract.path
+                    if scan_result.contract.found
+                    else ""
+                )
+                or None
+            )
+
+            setup_service = (
+                RepositorySetupService()
+            )
+
+            setup_plan = setup_service.build_plan(
+                repository=repository_metadata,
+                adapter=adapter,
+                base_branch=(
+                    scan_result.default_branch
+                    or project.default_branch
+                    or "main"
+                ),
+                spec_path=spec_path,
+            )
+
+            # Second idempotency guard: the database audit log can be missing
+            # when an earlier request successfully changed GitHub but failed
+            # before the final database write. Query GitHub directly as the
+            # source of truth before provisioning or writing anything again.
+            existing_pr = self._find_existing_setup_pull_request(
+                github_client=github_client,
+                installation_token=installation_token,
+                repository_full_name=repository_full_name,
+                branch_name=setup_plan.branch_name,
+            )
+
+            if existing_pr is not None:
+                metadata = self._metadata_from_pull_request(
+                    pull_request=existing_pr,
+                    setup_plan=setup_plan,
+                )
+                self._store_detected_configuration(
+                    project=project,
+                    scan_result=scan_result,
+                    spec_path=setup_plan.spec_path,
+                    adapter_type=setup_plan.adapter_type,
+                )
+                self._ensure_setup_audit(
+                    project=project,
+                    actor=request.user,
+                    connection=connection,
+                    metadata=metadata,
+                )
+                return self._response_from_setup_metadata(
+                    repository_full_name=repository_full_name,
+                    metadata=metadata,
+                    already_exists=True,
+                    scan=scan_result.as_dict(),
+                    adapter={
+                        "adapter_type": setup_plan.adapter_type,
+                        "framework_name": setup_plan.framework_name,
+                    },
+                    message=(
+                        "API compatibility setup pull request already "
+                        "exists for this repository."
+                    ),
+                )
+
+            existing_branch = self._github_branch_exists(
+                github_client=github_client,
+                installation_token=installation_token,
+                repository_full_name=repository_full_name,
+                branch_name=setup_plan.branch_name,
+            )
+
+            # Provision the project-scoped GitHub Actions credential before
+            # creating the setup PR. The setup workflow created above reads
+            # the project ID from the repository variable and the credential
+            # from the repository Actions secret. No plaintext token is
+            # returned to the browser or included in audit metadata.
+            provisioning_service = (
+                GitHubActionsProvisioningService(
+                    github_client=github_client
+                )
+            )
+
+            provisioning = provisioning_service.provision(
+                project=project,
+                installation_id=installation_id,
+                repository_full_name=repository_full_name,
+            )
+
+            if existing_branch:
+                # A previous attempt may have created the deterministic setup
+                # branch but failed while writing files or creating the PR.
+                # Reuse that branch, finish the files, and create exactly one
+                # setup PR instead of failing on branch creation.
+                execution = self._recover_existing_branch(
+                    github_client=github_client,
+                    installation_token=installation_token,
+                    plan=setup_plan,
+                )
+            else:
+                write_service = (
+                    GitHubWriteService(
+                        github_client=github_client
+                    )
+                )
+
+                execution = (
+                    write_service.execute_setup(
+                        installation_id=installation_id,
+                        plan=setup_plan,
+                    )
+                )
 
         except GitHubConfigurationError:
             return Response(
                 {
                     "detail": (
-                        "GitHub App is not configured on the server."
+                        "GitHub App is not configured "
+                        "on the server."
                     )
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        except GitHubAPIError:
+        except GitHubAPIError as exc:
             return Response(
                 {
                     "detail": (
-                        "Unable to scan the selected GitHub repository."
-                    )
+                        "GitHub setup could not be completed."
+                    ),
+                    "error": str(exc),
                 },
                 status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        except ValueError as exc:
+            return Response(
+                {
+                    "detail": str(exc)
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "Automatic GitHub repository setup failed."
+            )
+
             return Response(
                 {
                     "detail": (
-                        "Repository scan failed unexpectedly."
+                        "Automatic repository setup failed "
+                        "unexpectedly."
                     )
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        if not execution.success:
+            # Handle concurrent requests and partial GitHub writes. One
+            # request can win the branch/PR creation race while another sees
+            # a 4xx from GitHub. Re-read GitHub before returning an error.
+            try:
+                recovered_pr = self._find_existing_setup_pull_request(
+                    github_client=github_client,
+                    installation_token=installation_token,
+                    repository_full_name=repository_full_name,
+                    branch_name=setup_plan.branch_name,
+                )
+
+                if recovered_pr is not None:
+                    recovered_metadata = self._metadata_from_pull_request(
+                        pull_request=recovered_pr,
+                        setup_plan=setup_plan,
+                    )
+                    execution = self._execution_from_metadata(
+                        repository_full_name=repository_full_name,
+                        setup_plan=setup_plan,
+                        metadata=recovered_metadata,
+                    )
+                    self._store_detected_configuration(
+                        project=project,
+                        scan_result=scan_result,
+                        spec_path=setup_plan.spec_path,
+                        adapter_type=setup_plan.adapter_type,
+                    )
+                    self._ensure_setup_audit(
+                        project=project,
+                        actor=request.user,
+                        connection=connection,
+                        metadata=recovered_metadata,
+                    )
+                else:
+                    branch_now_exists = self._github_branch_exists(
+                        github_client=github_client,
+                        installation_token=installation_token,
+                        repository_full_name=repository_full_name,
+                        branch_name=setup_plan.branch_name,
+                    )
+
+                    if branch_now_exists:
+                        execution = self._recover_existing_branch(
+                            github_client=github_client,
+                            installation_token=installation_token,
+                            plan=setup_plan,
+                        )
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    "SETUP RECOVERY CHECK FAILED"
+                )
+
+        if not execution.success:
+            return Response(
+                {
+                    "detail": (
+                        "API Analyzer could not create "
+                        "the setup pull request."
+                    ),
+                    "repository": repository_full_name,
+                    "branch_name": execution.branch_name,
+                    "base_branch": execution.base_branch,
+                    "files_written": list(
+                        execution.files_written
+                    ),
+                    "error": execution.error,
+                    "warnings": list(
+                        execution.warnings
+                    ),
+                    "metadata": execution.metadata,
                 },
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
+        try:
+            self._store_detected_configuration(
+                project=project,
+                scan_result=scan_result,
+                spec_path=setup_plan.spec_path,
+                adapter_type=setup_plan.adapter_type,
+            )
+
+            AuditLog.objects.create(
+                project=project,
+                actor=request.user,
+                action="github_setup_pull_request_created",
+                resource_type="GitHubConnection",
+                resource_id=str(
+                    connection.pk
+                ),
+                metadata={
+                    "repository": repository_full_name,
+                    "branch_name": execution.branch_name,
+                    "base_branch": execution.base_branch,
+                    "pull_request_number": (
+                        execution.pull_request_number
+                    ),
+                    "pull_request_url": (
+                        execution.pull_request_url
+                    ),
+                    "adapter_type": setup_plan.adapter_type,
+                    "framework_name": setup_plan.framework_name,
+                    "spec_path": setup_plan.spec_path,
+                    "generation_command": setup_plan.generation_command,
+                    "ci_secret_name": provisioning.secret_name,
+                    "ci_variable_name": provisioning.variable_name,
+                    "ci_token_id": provisioning.token_id,
+                    "ci_tokens_rotated": (
+                        provisioning.rotated_existing_tokens
+                    ),
+                    "files_written": list(
+                        execution.files_written
+                    ),
+                    "setup_status": "setup_pending",
+                },
+            )
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "POST-SETUP FAILURE: final database update failed."
+            )
+
+            return Response(
+                {
+                    "detail": (
+                        "Setup PR was created, but the final database "
+                        "update failed."
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
         return Response(
-            result.as_dict(),
+            {
+                "success": True,
+                "already_exists": False,
+                "status": "setup_pending",
+                "repository": repository_full_name,
+                "scan": scan_result.as_dict(),
+                "adapter": {
+                    "adapter_type": setup_plan.adapter_type,
+                    "framework_name": (
+                        setup_plan.framework_name
+                    ),
+                },
+                "setup": {
+                    "branch_name": execution.branch_name,
+                    "base_branch": execution.base_branch,
+                    "files_written": list(
+                        execution.files_written
+                    ),
+                    "pull_request_number": (
+                        execution.pull_request_number
+                    ),
+                    "pull_request_url": (
+                        execution.pull_request_url
+                    ),
+                    "spec_path": setup_plan.spec_path,
+                    "generation_command": (
+                        setup_plan.generation_command
+                    ),
+                    "ci_credentials": {
+                        "secret_name": provisioning.secret_name,
+                        "variable_name": provisioning.variable_name,
+                        "token_id": provisioning.token_id,
+                        "rotated_existing_tokens": (
+                            provisioning.rotated_existing_tokens
+                        ),
+                    },
+                    "warnings": list(
+                        execution.warnings
+                    ),
+                },
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @staticmethod
+    def _latest_setup_audit(
+        *,
+        project: Project,
+        repository_full_name: str,
+    ) -> AuditLog | None:
+        """
+        Return the most recent successful setup audit for this exact project
+        and repository. This is the cheapest idempotency check and avoids a
+        second GitHub setup when the request is repeated from the UI.
+        """
+        return (
+            AuditLog.objects
+            .filter(
+                project=project,
+                action=SETUP_AUDIT_ACTION,
+                metadata__repository=repository_full_name,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+
+    @staticmethod
+    def _response_from_setup_metadata(
+        *,
+        repository_full_name: str,
+        metadata: dict[str, Any],
+        already_exists: bool,
+        scan: dict[str, Any] | None = None,
+        adapter: dict[str, Any] | None = None,
+        message: str,
+    ) -> Response:
+        stored_adapter = adapter or {
+            "adapter_type": str(
+                metadata.get("adapter_type") or ""
+            ),
+            "framework_name": str(
+                metadata.get("framework_name") or ""
+            ),
+        }
+
+        files_written = metadata.get(
+            "files_written"
+        )
+
+        if not isinstance(files_written, list):
+            files_written = list(DEFAULT_SETUP_FILES)
+
+        setup_status = str(
+            metadata.get("setup_status")
+            or "setup_pending"
+        )
+
+        return Response(
+            {
+                "success": True,
+                "already_exists": already_exists,
+                "status": setup_status,
+                "repository": repository_full_name,
+                "scan": scan,
+                "adapter": stored_adapter,
+                "setup": {
+                    "branch_name": str(
+                        metadata.get("branch_name") or ""
+                    ),
+                    "base_branch": str(
+                        metadata.get("base_branch") or "main"
+                    ),
+                    "files_written": files_written,
+                    "pull_request_number": metadata.get(
+                        "pull_request_number"
+                    ),
+                    "pull_request_url": metadata.get(
+                        "pull_request_url"
+                    ),
+                    "spec_path": str(
+                        metadata.get("spec_path") or ""
+                    ),
+                    "generation_command": str(
+                        metadata.get("generation_command") or ""
+                    ),
+                    "warnings": list(
+                        metadata.get("warnings") or []
+                    ),
+                },
+                "message": message,
+            },
             status=status.HTTP_200_OK,
         )
 
+    @staticmethod
+    def _github_parts(
+        repository_full_name: str,
+    ) -> tuple[str, str]:
+        parts = str(
+            repository_full_name or ""
+        ).strip().split("/", 1)
 
-class GitHubDisconnectView(APIView):
-    permission_classes = (IsAuthenticated,)
-
-    def post(self, request):
-        project_id = request.data.get("project_id")
-        project = _project_for_user(request, project_id)
-        if project is None:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
+        if len(parts) != 2 or not all(parts):
+            raise GitHubAPIError(
+                "repository_full_name must use the owner/repository format."
             )
 
-        connection = getattr(project, "github_connection", None)
-        if connection is None:
-            return Response(
-                {"connected": False},
-                status=status.HTTP_200_OK,
+        return parts[0], parts[1]
+
+    @classmethod
+    def _find_existing_setup_pull_request(
+        cls,
+        *,
+        github_client: GitHubAppClient,
+        installation_token: str,
+        repository_full_name: str,
+        branch_name: str,
+    ) -> dict[str, Any] | None:
+        """
+        Find any PR for the deterministic API Analyzer setup branch.
+
+        State=all is intentional. A merged/closed setup PR still means the
+        repository has already gone through onboarding and must not get a
+        second setup PR from a repeat click.
+        """
+        owner, repo = cls._github_parts(
+            repository_full_name
+        )
+
+        data = github_client._request(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls",
+            authorization=f"Bearer {installation_token}",
+            params={
+                "state": "all",
+                "head": f"{owner}:{branch_name}",
+                "per_page": 100,
+            },
+        )
+
+        if not isinstance(data, list):
+            return None
+
+        pull_requests = [
+            item
+            for item in data
+            if isinstance(item, dict)
+        ]
+
+        if not pull_requests:
+            return None
+
+        # Prefer open PRs, otherwise use the most recently returned PR.
+        for pull_request in pull_requests:
+            if str(
+                pull_request.get("state") or ""
+            ).lower() == "open":
+                return pull_request
+
+        return pull_requests[0]
+
+    @classmethod
+    def _github_branch_exists(
+        cls,
+        *,
+        github_client: GitHubAppClient,
+        installation_token: str,
+        repository_full_name: str,
+        branch_name: str,
+    ) -> bool:
+        owner, repo = cls._github_parts(
+            repository_full_name
+        )
+
+        path = (
+            f"/repos/{owner}/{repo}/git/ref/heads/"
+            f"{quote(str(branch_name).strip(), safe='/')}"
+        )
+
+        try:
+            data = github_client._request(
+                "GET",
+                path,
+                authorization=f"Bearer {installation_token}",
+            )
+        except GitHubAPIError as exc:
+            if exc.status_code == 404:
+                return False
+            raise
+
+        return isinstance(data, dict)
+
+    @staticmethod
+    def _metadata_from_pull_request(
+        *,
+        pull_request: dict[str, Any],
+        setup_plan: Any,
+    ) -> dict[str, Any]:
+        raw_number = pull_request.get("number")
+
+        try:
+            pull_request_number = (
+                int(raw_number)
+                if raw_number is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            pull_request_number = None
+
+        pull_request_url = str(
+            pull_request.get("html_url") or ""
+        ).strip() or None
+
+        actual_base = str(
+            (pull_request.get("base") or {}).get("ref")
+            if isinstance(pull_request.get("base"), dict)
+            else ""
+        ).strip()
+
+        return {
+            "repository": setup_plan.repository,
+            "branch_name": setup_plan.branch_name,
+            "base_branch": actual_base or setup_plan.base_branch,
+            "pull_request_number": pull_request_number,
+            "pull_request_url": pull_request_url,
+            "adapter_type": setup_plan.adapter_type,
+            "framework_name": setup_plan.framework_name,
+            "spec_path": setup_plan.spec_path,
+            "generation_command": setup_plan.generation_command,
+            "files_written": [
+                item.path
+                for item in setup_plan.files
+            ],
+            "setup_status": "setup_pending",
+            "recovered_from_github": True,
+        }
+
+    @staticmethod
+    def _execution_from_metadata(
+        *,
+        repository_full_name: str,
+        setup_plan: Any,
+        metadata: dict[str, Any],
+    ) -> SetupExecutionResult:
+        return SetupExecutionResult(
+            success=True,
+            repository=repository_full_name,
+            branch_name=setup_plan.branch_name,
+            base_branch=str(
+                metadata.get("base_branch")
+                or setup_plan.base_branch
+            ),
+            files_written=tuple(
+                metadata.get("files_written") or []
+            ),
+            pull_request_number=metadata.get(
+                "pull_request_number"
+            ),
+            pull_request_url=metadata.get(
+                "pull_request_url"
+            ),
+            warnings=tuple(
+                setup_plan.warnings
+            ),
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _recover_existing_branch(
+        *,
+        github_client: GitHubAppClient,
+        installation_token: str,
+        plan: Any,
+    ) -> SetupExecutionResult:
+        files_written: list[str] = []
+
+        try:
+            for setup_file in plan.files:
+                github_client.create_or_update_repository_file(
+                    installation_token,
+                    plan.repository,
+                    path=setup_file.path,
+                    content=setup_file.content,
+                    branch=plan.branch_name,
+                    commit_message=(
+                        "chore: configure API compatibility analysis"
+                    ),
+                )
+                files_written.append(
+                    setup_file.path
+                )
+
+            pull_request = github_client.create_pull_request(
+                installation_token,
+                plan.repository,
+                title=plan.pull_request_title,
+                head=plan.branch_name,
+                base=plan.base_branch,
+                body=plan.pull_request_body,
             )
 
-        connection.repository_full_name = ""
-        connection.connected = False
-        connection.save(
-            update_fields=[
-                "repository_full_name",
-                "connected",
-                "updated_at",
-            ]
-        )
+            raw_number = pull_request.get("number")
+            try:
+                pull_request_number = (
+                    int(raw_number)
+                    if raw_number is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                pull_request_number = None
 
-        project.repository_full_name = ""
-        project.default_branch = ""
-        project.save(
-            update_fields=[
-                "repository_full_name",
-                "default_branch",
-                "updated_at",
-            ]
-        )
+            pull_request_url = str(
+                pull_request.get("html_url") or ""
+            ).strip() or None
 
-        AuditLog.objects.create(
+            return SetupExecutionResult(
+                success=True,
+                repository=plan.repository,
+                branch_name=plan.branch_name,
+                base_branch=plan.base_branch,
+                files_written=tuple(files_written),
+                pull_request_number=pull_request_number,
+                pull_request_url=pull_request_url,
+                warnings=tuple(plan.warnings),
+                metadata={
+                    "setup_mode": "automatic",
+                    "review_required": True,
+                    "adapter_type": plan.adapter_type,
+                    "framework_name": plan.framework_name,
+                    "spec_path": plan.spec_path,
+                    "recovered_existing_branch": True,
+                },
+            )
+
+        except GitHubAPIError as exc:
+            return SetupExecutionResult(
+                success=False,
+                repository=plan.repository,
+                branch_name=plan.branch_name,
+                base_branch=plan.base_branch,
+                files_written=tuple(files_written),
+                warnings=tuple(plan.warnings),
+                error=str(exc),
+                metadata={
+                    "setup_mode": "automatic",
+                    "recovered_existing_branch": True,
+                    "adapter_type": plan.adapter_type,
+                    "framework_name": plan.framework_name,
+                    "failed_stage": (
+                        "file_write"
+                        if files_written
+                        else "file_write"
+                    ),
+                },
+            )
+
+        except Exception as exc:
+            return SetupExecutionResult(
+                success=False,
+                repository=plan.repository,
+                branch_name=plan.branch_name,
+                base_branch=plan.base_branch,
+                files_written=tuple(files_written),
+                warnings=tuple(plan.warnings),
+                error=(
+                    "Unexpected setup recovery failure: "
+                    f"{exc}"
+                ),
+                metadata={
+                    "setup_mode": "automatic",
+                    "recovered_existing_branch": True,
+                    "adapter_type": plan.adapter_type,
+                    "framework_name": plan.framework_name,
+                },
+            )
+
+    @staticmethod
+    def _ensure_setup_audit(
+        *,
+        project: Project,
+        actor: Any,
+        connection: GitHubConnection,
+        metadata: dict[str, Any],
+    ) -> AuditLog:
+        existing = GitHubRepositorySetupView._latest_setup_audit(
             project=project,
-            actor=request.user,
-            action="github_repository_disconnected",
+            repository_full_name=str(
+                metadata.get("repository") or ""
+            ),
+        )
+
+        if existing is not None:
+            return existing
+
+        return AuditLog.objects.create(
+            project=project,
+            actor=actor,
+            action=SETUP_AUDIT_ACTION,
             resource_type="GitHubConnection",
             resource_id=str(connection.pk),
-            metadata={},
+            metadata=metadata,
         )
 
-        return Response(
-            {"connected": False},
-            status=status.HTTP_200_OK,
+    @staticmethod
+    def _store_detected_configuration_from_audit(
+        *,
+        project: Project,
+        metadata: dict[str, Any],
+    ) -> None:
+        update_fields: list[str] = []
+
+        adapter_type = str(
+            metadata.get("adapter_type") or ""
+        ).strip()
+        spec_path = str(
+            metadata.get("spec_path") or ""
+        ).strip()
+        base_branch = str(
+            metadata.get("base_branch") or ""
+        ).strip()
+
+        if adapter_type and project.adapter_type != adapter_type:
+            project.adapter_type = adapter_type
+            update_fields.append("adapter_type")
+
+        if spec_path and project.spec_path != spec_path:
+            project.spec_path = spec_path
+            update_fields.append("spec_path")
+
+        if base_branch and project.default_branch != base_branch:
+            project.default_branch = base_branch
+            update_fields.append("default_branch")
+
+        if update_fields:
+            update_fields.append("updated_at")
+            project.save(update_fields=update_fields)
+
+    @staticmethod
+    def _repository_metadata(
+        *,
+        scan_result: Any,
+        repository_full_name: str,
+        project: Project,
+    ) -> dict[str, Any]:
+        """
+        Convert the scanner result into the adapter registry's
+        framework-agnostic repository metadata format.
+        """
+
+        tree_paths = tuple(
+            getattr(
+                scan_result,
+                "tree_paths",
+                (),
+            )
+            or ()
         )
+
+        manifest_contents = dict(
+            getattr(
+                scan_result,
+                "manifest_contents",
+                {},
+            )
+            or {}
+        )
+
+        source_contents = dict(
+            getattr(
+                scan_result,
+                "source_contents",
+                {},
+            )
+            or {}
+        )
+
+        metadata: dict[str, Any] = {
+            "repository_full_name": (
+                repository_full_name
+            ),
+            "default_branch": (
+                scan_result.default_branch
+                or project.default_branch
+                or "main"
+            ),
+            # Internal scanner evidence is passed to the adapter registry.
+            # Manifest contents are never returned by scan_result.as_dict().
+            "tree_paths": list(tree_paths),
+            "manifest_contents": manifest_contents,
+            "source_contents": source_contents,
+            "source_files": list(tree_paths),
+            "warnings": list(
+                scan_result.warnings
+            ),
+        }
+
+        # The scanner's public result intentionally contains only the
+        # onboarding-level information. The adapter registry can use the
+        # stored project configuration as an additional signal.
+        if scan_result.contract.found:
+            metadata["spec_path"] = (
+                scan_result.contract.path
+            )
+
+        if scan_result.framework.detected:
+            metadata["detected_adapter_type"] = (
+                scan_result.framework.adapter_type
+            )
+
+        return metadata
+
+    @staticmethod
+    def _store_detected_configuration(
+        *,
+        project: Project,
+        scan_result: Any,
+        spec_path: str,
+        adapter_type: str,
+    ) -> None:
+        update_fields: list[str] = []
+
+        if spec_path and project.spec_path != spec_path:
+            project.spec_path = spec_path
+            update_fields.append(
+                "spec_path"
+            )
+
+        if (
+            adapter_type
+            and project.adapter_type != adapter_type
+        ):
+            project.adapter_type = adapter_type
+            update_fields.append(
+                "adapter_type"
+            )
+
+        if (
+            scan_result.default_branch
+            and project.default_branch
+            != scan_result.default_branch
+        ):
+            project.default_branch = (
+                scan_result.default_branch
+            )
+            update_fields.append(
+                "default_branch"
+            )
+
+        if update_fields:
+            update_fields.append(
+                "updated_at"
+            )
+
+            project.save(
+                update_fields=update_fields
+            )
 
 
 __all__ = [
-    "GitHubConnectionView",
-    "GitHubDisconnectView",
-    "GitHubInstallCallbackView",
-    "GitHubInstallStartView",
-    "GitHubRepositoryConnectView",
-    "GitHubRepositoryListView",
-    "GitHubRepositoryScanView",
+    "GitHubRepositorySetupView",
 ]
