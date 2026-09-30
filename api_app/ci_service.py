@@ -813,17 +813,40 @@ def build_ci_response(
     return {
         "comparison_id": comparison.pk,
         "job_id": job.pk if job else None,
+
         "status": status,
+
         "gate_status": getattr(
             comparison,
             "gate_status",
             None,
         ),
+
+        # IMPORTANT:
+        # This is the actual API compatibility gate reason.
+        "reason_code": (
+            getattr(
+                comparison,
+                "gate_reason_code",
+                None,
+            )
+            or getattr(
+                job,
+                "error_code",
+                None,
+            )
+        ),
+
         "report_url": (
             f"/api/comparisons/{comparison.pk}/"
         ),
+
         "created": submission_result["created"],
+
+        # These describe HOW the analyzer executed.
+        # They are NOT the gate result/reason.
         "execution_mode": execution_mode,
+
         "execution_reason": submission_result.get(
             "execution_reason"
         ),
