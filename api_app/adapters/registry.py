@@ -59,6 +59,10 @@ class AdapterResolution:
 
     reason:
         Human-readable explanation when no adapter is selected.
+
+    errors:
+        Structured diagnostics from adapters that could not claim the
+        repository. These are informational and do not alter analyzer rules.
     """
 
     supported: bool
@@ -68,6 +72,10 @@ class AdapterResolution:
     detection: AdapterDetectionResult | None = None
 
     reason: str = ""
+
+    # Per-adapter detection failures. These are diagnostic only and never
+    # decide compatibility or breaking-change severity.
+    errors: tuple[str, ...] = ()
 
 
 # ============================================================================
@@ -229,19 +237,19 @@ class AdapterRegistry:
         repository: Mapping[str, Any],
     ) -> AdapterResolution:
         """
-        Determine which adapter supports the repository.
+        Determine which registered adapter supports the repository.
 
         Detection is deterministic.
 
-        Each registered adapter is given the normalized repository evidence.
-        The first adapter returning `detected=True` is selected.
+        When the repository scanner supplies ``detected_adapter_type``, that
+        adapter is tried first. The hint is never trusted by itself: the
+        selected adapter must still return ``detected=True``.
 
-        Adapter exceptions are handled as detection failures for that adapter
-        so one faulty adapter does not prevent unrelated adapters from being
-        checked.
+        If the hinted adapter is absent or rejects the repository, the remaining
+        adapters are checked in registration order.
 
-        The exception information is returned in the final reason instead of
-        being silently swallowed.
+        Adapter exceptions are recorded as structured diagnostics so one faulty
+        adapter does not prevent unrelated adapters from being checked.
         """
 
         if not isinstance(
@@ -255,14 +263,34 @@ class AdapterRegistry:
         if not self._adapters:
             return AdapterResolution(
                 supported=False,
-                reason=(
-                    "No contract adapters are registered."
-                ),
+                reason="No contract adapters are registered.",
+                errors=(),
             )
 
         detection_errors: list[str] = []
 
+        hinted_type = str(
+            repository.get("detected_adapter_type") or ""
+        ).strip()
+
+        adapters_to_check: list[ContractAdapter] = []
+
+        if hinted_type:
+            hinted_adapter = self.get(hinted_type)
+
+            if hinted_adapter is not None:
+                adapters_to_check.append(hinted_adapter)
+            else:
+                detection_errors.append(
+                    f"scanner hint '{hinted_type}' does not match "
+                    "any registered adapter."
+                )
+
         for adapter in self._adapters.values():
+            if adapter not in adapters_to_check:
+                adapters_to_check.append(adapter)
+
+        for adapter in adapters_to_check:
             try:
                 detection = adapter.detect(
                     repository
@@ -296,6 +324,18 @@ class AdapterRegistry:
                             "detected the repository."
                         )
                     ),
+                    errors=tuple(detection_errors),
+                )
+
+            # A valid negative result is useful diagnostic information when a
+            # scanner hint explicitly requested that adapter first.
+            if (
+                hinted_type
+                and adapter.adapter_type == hinted_type
+                and detection.reason
+            ):
+                detection_errors.append(
+                    f"{adapter.adapter_type}: {detection.reason}"
                 )
 
         if detection_errors:
@@ -303,9 +343,10 @@ class AdapterRegistry:
                 supported=False,
                 reason=(
                     "No registered adapter detected the repository. "
-                    "Adapter detection errors: "
+                    "Adapter detection diagnostics: "
                     + "; ".join(detection_errors)
                 ),
+                errors=tuple(detection_errors),
             )
 
         return AdapterResolution(
@@ -314,6 +355,7 @@ class AdapterRegistry:
                 "No registered adapter detected a supported "
                 "framework or contract source."
             ),
+            errors=(),
         )
 
     # ------------------------------------------------------------------
