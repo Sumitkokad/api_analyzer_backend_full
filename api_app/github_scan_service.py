@@ -63,6 +63,37 @@ MANIFEST_NAMES = (
     "settings.gradle.kts",
 )
 
+# Targeted Python files that commonly contain API-framework imports.
+PYTHON_SOURCE_FILENAMES = {
+    "manage.py",
+    "settings.py",
+    "urls.py",
+    "views.py",
+    "serializers.py",
+    "serializer.py",
+    "schemas.py",
+    "schema.py",
+    "routers.py",
+    "router.py",
+    "api.py",
+    "routes.py",
+    "app.py",
+}
+
+PYTHON_SOURCE_DIR_HINTS = {
+    "api",
+    "apis",
+    "backend",
+    "views",
+    "serializers",
+    "schemas",
+    "routes",
+    "routers",
+    "rest",
+}
+
+MAX_SOURCE_FILES = 30
+
 
 @dataclass(frozen=True)
 class ContractDetection:
@@ -86,6 +117,7 @@ class FrameworkDetection:
 class RepositoryScanResult:
     repository: str
     default_branch: str
+    commit_sha: str
     contract: ContractDetection
     framework: FrameworkDetection
     scanned_files: int
@@ -102,10 +134,19 @@ class RepositoryScanResult:
         repr=False,
     )
 
+    # Small, targeted source snippets used only by the adapter layer.
+    # They are hidden from as_dict() so repository source is not returned
+    # through the scan API.
+    source_contents: dict[str, str] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "repository": self.repository,
             "default_branch": self.default_branch,
+            "commit_sha": self.commit_sha,
             "contract": {
                 "found": self.contract.found,
                 "path": self.contract.path,
@@ -241,6 +282,7 @@ def _contains_any(text: str, needles: Iterable[str]) -> bool:
 def _detect_framework(
     tree_paths: list[str],
     manifest_contents: dict[str, str],
+    source_contents: dict[str, str] | None = None,
 ) -> FrameworkDetection:
     paths = {_normalize_path(path) for path in tree_paths}
     names = {
@@ -265,25 +307,30 @@ def _detect_framework(
     ]
     python_text = "\n".join(python_manifests)
 
+    source_text = "\n".join(
+        str(content)
+        for content in (source_contents or {}).values()
+        if content
+    )
+    python_evidence_text = f"{python_text}\n{source_text}"
+
     # Django/DRF first because DRF is a direct API framework signal.
     if (
         "manage.py" in names
         or _contains_any(
-            python_text,
+            python_evidence_text,
             (
                 "django",
                 "djangorestframework",
                 "rest_framework",
-                "drf",
             ),
         )
     ):
         if _contains_any(
-            python_text,
+            python_evidence_text,
             (
                 "djangorestframework",
                 "rest_framework",
-                "drf",
             ),
         ):
             evidence.append("Django REST Framework dependency detected.")
@@ -304,7 +351,7 @@ def _detect_framework(
         )
 
     if _contains_any(
-        python_text,
+        python_evidence_text,
         (
             "fastapi",
         ),
@@ -320,7 +367,7 @@ def _detect_framework(
         )
 
     if _contains_any(
-        python_text,
+        python_evidence_text,
         (
             "flask",
         ),
@@ -556,6 +603,57 @@ class GitHubRepositoryScanner:
         # Avoid downloading an arbitrary number of manifests in a monorepo.
         return sorted(set(candidates))[:20]
 
+    def _candidate_source_paths(
+        self,
+        tree_paths: Iterable[str],
+    ) -> list[str]:
+        """Select a small deterministic set of Python files for framework detection."""
+
+        candidates: list[tuple[int, str]] = []
+
+        for raw_path in tree_paths:
+            path = _normalize_path(raw_path)
+
+            if _is_ignored(path) or not _path_is_python(path):
+                continue
+
+            basename = posixpath.basename(path).lower()
+            components = {
+                part.lower()
+                for part in posixpath.dirname(path).split("/")
+                if part
+            }
+
+            priority = 99
+
+            if basename in PYTHON_SOURCE_FILENAMES:
+                priority = 0
+            elif components & PYTHON_SOURCE_DIR_HINTS:
+                priority = 1
+            elif any(
+                marker in basename
+                for marker in (
+                    "view",
+                    "serial",
+                    "schema",
+                    "router",
+                    "route",
+                    "api",
+                )
+            ):
+                priority = 2
+
+            if priority < 99:
+                candidates.append((priority, path))
+
+        return [
+            path
+            for _, path in sorted(
+                set(candidates),
+                key=lambda item: (item[0], item[1]),
+            )
+        ][:MAX_SOURCE_FILES]
+
     def scan(
         self,
         repository_full_name: str,
@@ -573,10 +671,24 @@ class GitHubRepositoryScanner:
             or "main"
         ).strip()
 
+        if not resolved_branch:
+            raise ValueError(
+                "Unable to determine the repository default branch."
+            )
+
+        # Resolve the branch exactly once, then scan that immutable commit.
+        # This prevents a moving branch from producing a mixed revision where
+        # tree metadata and file contents come from different commits.
+        commit_sha = self.client.get_branch_sha(
+            self.installation_token,
+            repository_full_name,
+            resolved_branch,
+        )
+
         tree_data = self.client.get_repository_tree(
             self.installation_token,
             repository_full_name,
-            tree_ref=resolved_branch,
+            tree_ref=commit_sha,
             recursive=True,
         )
 
@@ -598,7 +710,7 @@ class GitHubRepositoryScanner:
                     self.installation_token,
                     repository_full_name,
                     path,
-                    ref=resolved_branch,
+                    ref=commit_sha,
                 )
             except Exception:
                 # A single inaccessible/oversized manifest should not make
@@ -609,9 +721,28 @@ class GitHubRepositoryScanner:
             if content:
                 manifest_contents[path] = content
 
+        # Fetch only targeted Python source files. This lets adapters detect
+        # framework imports when dependency manifests do not expose them.
+        source_contents: dict[str, str] = {}
+        for path in self._candidate_source_paths(file_paths):
+            try:
+                file_data = self.client.get_repository_file(
+                    self.installation_token,
+                    repository_full_name,
+                    path,
+                    ref=commit_sha,
+                )
+            except Exception:
+                continue
+
+            content = str(file_data.get("content") or "")
+            if content:
+                source_contents[path] = content
+
         framework = _detect_framework(
             file_paths,
             manifest_contents,
+            source_contents,
         )
 
         warnings: list[str] = []
@@ -637,6 +768,7 @@ class GitHubRepositoryScanner:
             or repository_full_name
         ),
         default_branch=resolved_branch,
+        commit_sha=commit_sha,
         contract=contract,
         framework=framework,
         scanned_files=len(file_paths),
@@ -647,6 +779,7 @@ class GitHubRepositoryScanner:
         warnings=warnings,
         tree_paths=tuple(file_paths),
         manifest_contents=dict(manifest_contents),
+        source_contents=dict(source_contents),
     )
 
 
