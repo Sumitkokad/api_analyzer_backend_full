@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import time
 from typing import Any, Mapping
 from urllib.parse import quote
@@ -525,6 +526,63 @@ class GitHubAppClient:
 
         return data
 
+    def get_branch_sha(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+        branch_name: str,
+    ) -> str:
+        """Return the exact commit SHA currently pointed to by a branch."""
+        parts = (
+            repository_full_name
+            .strip()
+            .split("/", 1)
+        )
+
+        if len(parts) != 2 or not all(parts):
+            raise GitHubAPIError(
+                "repository_full_name must use the "
+                "owner/repository format."
+            )
+
+        branch_name = str(branch_name or "").strip()
+        if not branch_name:
+            raise GitHubAPIError("branch_name is required.")
+        if "\r" in branch_name or "\n" in branch_name:
+            raise GitHubAPIError("branch_name cannot contain newlines.")
+
+        owner, repo = parts
+
+        data = self._request(
+            "GET",
+            (
+                f"/repos/{owner}/{repo}/git/ref/heads/"
+                f"{quote(branch_name, safe='/')}"
+            ),
+            authorization=(
+                f"Bearer {installation_token}"
+            ),
+        )
+
+        if not isinstance(data, dict):
+            raise GitHubAPIError(
+                "GitHub branch reference response is invalid."
+            )
+
+        object_data = data.get("object") or {}
+        if not isinstance(object_data, dict):
+            raise GitHubAPIError(
+                "GitHub branch reference response is invalid."
+            )
+
+        sha = str(object_data.get("sha") or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+            raise GitHubAPIError(
+                "GitHub branch reference did not contain a valid commit SHA."
+            )
+
+        return sha
+
     def get_repository_tree(
         self,
         installation_token: str,
@@ -776,6 +834,52 @@ class GitHubAppClient:
             )
 
         return data
+
+    def delete_branch(
+        self,
+        installation_token: str,
+        repository_full_name: str,
+        branch_name: str,
+    ) -> None:
+        """Delete a repository branch by name."""
+        parts = (
+            repository_full_name
+            .strip()
+            .split("/", 1)
+        )
+
+        if len(parts) != 2 or not all(parts):
+            raise GitHubAPIError(
+                "repository_full_name must use the "
+                "owner/repository format."
+            )
+
+        branch_name = (
+            str(branch_name or "")
+            .strip()
+            .removeprefix("refs/heads/")
+        )
+
+        if (
+            not branch_name
+            or branch_name.startswith("/")
+            or ".." in branch_name
+            or "\r" in branch_name
+            or "\n" in branch_name
+        ):
+            raise GitHubAPIError("Invalid branch_name.")
+
+        owner, repo = parts
+        self._request(
+            "DELETE",
+            (
+                f"/repos/{owner}/{repo}/git/refs/heads/"
+                f"{quote(branch_name, safe='/')}"
+            ),
+            authorization=(
+                f"Bearer {installation_token}"
+            ),
+        )
 
     def create_or_update_repository_file(
         self,
